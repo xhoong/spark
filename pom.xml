@@ -25,7 +25,7 @@
     <version>14</version>
   </parent>
   <groupId>org.apache.spark</groupId>
-  <artifactId>spark-parent_2.10</artifactId>
+  <artifactId>spark-parent_2.11</artifactId>
   <version>1.6.0-SNAPSHOT</version>
   <packaging>pom</packaging>
   <name>Spark Project Parent POM</name>
@@ -100,6 +100,7 @@
     <module>sql/hive</module>
     <module>unsafe</module>
     <module>assembly</module>
+<!--
     <module>external/twitter</module>
     <module>external/flume</module>
     <module>external/flume-sink</module>
@@ -108,6 +109,7 @@
     <module>external/mqtt-assembly</module>
     <module>external/zeromq</module>
     <module>examples</module>
+-->
     <module>repl</module>
     <module>launcher</module>
     <module>external/kafka</module>
@@ -160,7 +162,7 @@
     <httpclient.classic.version>3.1</httpclient.classic.version>
     <commons.math3.version>3.4.1</commons.math3.version>
     <scala.version>2.10.4</scala.version>
-    <scala.binary.version>2.10</scala.binary.version>
+    <scala.binary.version>2.11</scala.binary.version>
     <jline.version>${scala.version}</jline.version>
     <jline.groupid>org.scala-lang</jline.groupid>
     <codehaus.jackson.version>1.9.13</codehaus.jackson.version>
