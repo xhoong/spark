@@ -18,7 +18,7 @@
 package org.apache.spark.sql.hive
 
 import org.apache.spark.sql.{QueryTest, Row, SaveMode}
-import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.{AliasIdentifier, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.CatalogTableType
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias
@@ -62,7 +62,7 @@ class HiveMetastoreCatalogSuite extends TestHiveSingleton with SQLTestUtils {
       spark.sql("create view vw1 as select 1 as id")
       val plan = spark.sql("select id from vw1").queryExecution.analyzed
       val aliases = plan.collect {
-        case x @ SubqueryAlias("vw1", _) => x
+        case x @ SubqueryAlias(AliasIdentifier("vw1", Some("default")), _) => x
       }
       assert(aliases.size == 1)
     }
@@ -145,6 +145,12 @@ class DataSourceWithHiveMetastoreCatalogSuite
     ('id + 0.1) cast DecimalType(10, 3) as 'd1,
     'id cast StringType as 'd2
   ).coalesce(1)
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    sparkSession.sessionState.catalog.reset()
+    sparkSession.metadataHive.reset()
+  }
 
   Seq(
     "parquet" -> ((

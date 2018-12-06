@@ -46,7 +46,7 @@ case class ShuffledHashJoinExec(
     "avgHashProbe" -> SQLMetrics.createAverageMetric(sparkContext, "avg hash probe"))
 
   override def requiredChildDistribution: Seq[Distribution] =
-    ClusteredDistribution(leftKeys) :: ClusteredDistribution(rightKeys) :: Nil
+    HashClusteredDistribution(leftKeys) :: HashClusteredDistribution(rightKeys) :: Nil
 
   private def buildHashedRelation(iter: Iterator[InternalRow]): HashedRelation = {
     val buildDataSize = longMetric("buildDataSize")
@@ -57,7 +57,7 @@ case class ShuffledHashJoinExec(
     buildTime += (System.nanoTime() - start) / 1000000
     buildDataSize += relation.estimatedSize
     // This relation is usually used until the end of task.
-    context.addTaskCompletionListener(_ => relation.close())
+    context.addTaskCompletionListener[Unit](_ => relation.close())
     relation
   }
 

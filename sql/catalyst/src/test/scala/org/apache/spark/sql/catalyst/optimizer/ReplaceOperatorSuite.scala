@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.optimizer
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
-import org.apache.spark.sql.catalyst.expressions.{Alias, Not}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Literal, Not}
 import org.apache.spark.sql.catalyst.expressions.aggregate.First
 import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftSemi, PlanTest}
 import org.apache.spark.sql.catalyst.plans.logical._
@@ -42,7 +42,7 @@ class ReplaceOperatorSuite extends PlanTest {
     val table1 = LocalRelation('a.int, 'b.int)
     val table2 = LocalRelation('c.int, 'd.int)
 
-    val query = Intersect(table1, table2)
+    val query = Intersect(table1, table2, isAll = false)
     val optimized = Optimize.execute(query.analyze)
 
     val correctAnswer =
@@ -60,7 +60,7 @@ class ReplaceOperatorSuite extends PlanTest {
     val table2 = Filter(attributeB === 2, Filter(attributeA === 1, table1))
     val table3 = Filter(attributeB < 1, Filter(attributeA >= 2, table1))
 
-    val query = Except(table2, table3)
+    val query = Except(table2, table3, isAll = false)
     val optimized = Optimize.execute(query.analyze)
 
     val correctAnswer =
@@ -79,7 +79,7 @@ class ReplaceOperatorSuite extends PlanTest {
     val table1 = LocalRelation.fromExternalRows(Seq(attributeA, attributeB), data = Seq(Row(1, 2)))
     val table2 = Filter(attributeB < 1, Filter(attributeA >= 2, table1))
 
-    val query = Except(table1, table2)
+    val query = Except(table1, table2, isAll = false)
     val optimized = Optimize.execute(query.analyze)
 
     val correctAnswer =
@@ -99,7 +99,7 @@ class ReplaceOperatorSuite extends PlanTest {
     val table3 = Project(Seq(attributeA, attributeB),
       Filter(attributeB < 1, Filter(attributeA >= 2, table1)))
 
-    val query = Except(table2, table3)
+    val query = Except(table2, table3, isAll = false)
     val optimized = Optimize.execute(query.analyze)
 
     val correctAnswer =
@@ -120,7 +120,7 @@ class ReplaceOperatorSuite extends PlanTest {
     val table3 = Project(Seq(attributeA, attributeB),
       Filter(attributeB < 1, Filter(attributeA >= 2, table1)))
 
-    val query = Except(table2, table3)
+    val query = Except(table2, table3, isAll = false)
     val optimized = Optimize.execute(query.analyze)
 
     val correctAnswer =
@@ -141,7 +141,7 @@ class ReplaceOperatorSuite extends PlanTest {
       Filter(attributeB < 1, Filter(attributeA >= 2, table1)))
     val table3 = Filter(attributeB === 2, Filter(attributeA === 1, table1))
 
-    val query = Except(table2, table3)
+    val query = Except(table2, table3, isAll = false)
     val optimized = Optimize.execute(query.analyze)
 
     val correctAnswer =
@@ -158,12 +158,27 @@ class ReplaceOperatorSuite extends PlanTest {
     val table1 = LocalRelation('a.int, 'b.int)
     val table2 = LocalRelation('c.int, 'd.int)
 
-    val query = Except(table1, table2)
+    val query = Except(table1, table2, isAll = false)
     val optimized = Optimize.execute(query.analyze)
 
     val correctAnswer =
       Aggregate(table1.output, table1.output,
         Join(table1, table2, LeftAnti, Option('a <=> 'c && 'b <=> 'd))).analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("replace Except with Filter when only right filter can be applied to the left") {
+    val table = LocalRelation(Seq('a.int, 'b.int))
+    val left = table.where('b < 1).select('a).as("left")
+    val right = table.where('b < 3).select('a).as("right")
+
+    val query = Except(left, right, isAll = false)
+    val optimized = Optimize.execute(query.analyze)
+
+    val correctAnswer =
+      Aggregate(left.output, right.output,
+        Join(left, right, LeftAnti, Option($"left.a" <=> $"right.a"))).analyze
 
     comparePlans(optimized, correctAnswer)
   }
@@ -195,6 +210,14 @@ class ReplaceOperatorSuite extends PlanTest {
         ),
         input)
 
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("add one grouping key if necessary when replace Deduplicate with Aggregate") {
+    val input = LocalRelation()
+    val query = Deduplicate(Seq.empty, input) // dropDuplicates()
+    val optimized = Optimize.execute(query.analyze)
+    val correctAnswer = Aggregate(Seq(Literal(1)), input.output, input)
     comparePlans(optimized, correctAnswer)
   }
 

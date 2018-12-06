@@ -18,8 +18,8 @@
 package org.apache.spark.sql.catalyst.optimizer
 
 import scala.annotation.tailrec
-import scala.collection.mutable
 
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.planning.ExtractFiltersAndInnerJoins
 import org.apache.spark.sql.catalyst.plans._
@@ -155,60 +155,49 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
 }
 
 /**
- * A rule that eliminates CROSS joins by inferring join conditions from propagated constraints.
- *
- * The optimization is applicable only to CROSS joins. For other join types, adding inferred join
- * conditions would potentially shuffle children as child node's partitioning won't satisfy the JOIN
- * node's requirements which otherwise could have.
- *
- * For instance, given a CROSS join with the constraint 'a = 1' from the left child and the
- * constraint 'b = 1' from the right child, this rule infers a new join predicate 'a = b' and
- * converts it to an Inner join.
+ * PythonUDF in join condition can't be evaluated if it refers to attributes from both join sides.
+ * See `ExtractPythonUDFs` for details. This rule will detect un-evaluable PythonUDF and pull them
+ * out from join condition.
  */
-object EliminateCrossJoin extends Rule[LogicalPlan] with PredicateHelper {
+object PullOutPythonUDFInJoinCondition extends Rule[LogicalPlan] with PredicateHelper {
 
-  def apply(plan: LogicalPlan): LogicalPlan = {
-    if (SQLConf.get.constraintPropagationEnabled) {
-      eliminateCrossJoin(plan)
-    } else {
-      plan
-    }
+  private def hasUnevaluablePythonUDF(expr: Expression, j: Join): Boolean = {
+    expr.find { e =>
+      PythonUDF.isScalarPythonUDF(e) && !canEvaluate(e, j.left) && !canEvaluate(e, j.right)
+    }.isDefined
   }
 
-  private def eliminateCrossJoin(plan: LogicalPlan): LogicalPlan = plan transform {
-    case join @ Join(leftPlan, rightPlan, Cross, None) =>
-      val leftConstraints = join.constraints.filter(_.references.subsetOf(leftPlan.outputSet))
-      val rightConstraints = join.constraints.filter(_.references.subsetOf(rightPlan.outputSet))
-      val inferredJoinPredicates = inferJoinPredicates(leftConstraints, rightConstraints)
-      val joinConditionOpt = inferredJoinPredicates.reduceOption(And)
-      if (joinConditionOpt.isDefined) Join(leftPlan, rightPlan, Inner, joinConditionOpt) else join
+  override def apply(plan: LogicalPlan): LogicalPlan = plan transformUp {
+    case j @ Join(_, _, joinType, Some(cond)) if hasUnevaluablePythonUDF(cond, j) =>
+      if (!joinType.isInstanceOf[InnerLike] && joinType != LeftSemi) {
+        // The current strategy only support InnerLike and LeftSemi join because for other type,
+        // it breaks SQL semantic if we run the join condition as a filter after join. If we pass
+        // the plan here, it'll still get a an invalid PythonUDF RuntimeException with message
+        // `requires attributes from more than one child`, we throw firstly here for better
+        // readable information.
+        throw new AnalysisException("Using PythonUDF in join condition of join type" +
+          s" $joinType is not supported.")
+      }
+      // If condition expression contains python udf, it will be moved out from
+      // the new join conditions.
+      val (udf, rest) = splitConjunctivePredicates(cond).partition(hasUnevaluablePythonUDF(_, j))
+      val newCondition = if (rest.isEmpty) {
+        logWarning(s"The join condition:$cond of the join plan contains PythonUDF only," +
+          s" it will be moved out and the join plan will be turned to cross join.")
+        None
+      } else {
+        Some(rest.reduceLeft(And))
+      }
+      val newJoin = j.copy(condition = newCondition)
+      joinType match {
+        case _: InnerLike => Filter(udf.reduceLeft(And), newJoin)
+        case LeftSemi =>
+          Project(
+            j.left.output.map(_.toAttribute),
+            Filter(udf.reduceLeft(And), newJoin.copy(joinType = Inner)))
+        case _ =>
+          throw new AnalysisException("Using PythonUDF in join condition of join type" +
+            s" $joinType is not supported.")
+      }
   }
-
-  private def inferJoinPredicates(
-      leftConstraints: Set[Expression],
-      rightConstraints: Set[Expression]): mutable.Set[EqualTo] = {
-
-    val equivalentExpressionMap = new EquivalentExpressionMap()
-
-    leftConstraints.foreach {
-      case EqualTo(attr: Attribute, expr: Expression) =>
-        equivalentExpressionMap.put(expr, attr)
-      case EqualTo(expr: Expression, attr: Attribute) =>
-        equivalentExpressionMap.put(expr, attr)
-      case _ =>
-    }
-
-    val joinConditions = mutable.Set.empty[EqualTo]
-
-    rightConstraints.foreach {
-      case EqualTo(attr: Attribute, expr: Expression) =>
-        joinConditions ++= equivalentExpressionMap.get(expr).map(EqualTo(attr, _))
-      case EqualTo(expr: Expression, attr: Attribute) =>
-        joinConditions ++= equivalentExpressionMap.get(expr).map(EqualTo(attr, _))
-      case _ =>
-    }
-
-    joinConditions
-  }
-
 }

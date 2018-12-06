@@ -22,11 +22,11 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
+import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical._
-import org.apache.spark.sql.execution.{BinaryExecNode, CodegenSupport,
-ExternalAppendOnlyUnsafeRowArray, RowIterator, SparkPlan}
+import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.util.collection.BitSet
 
@@ -78,7 +78,7 @@ case class SortMergeJoinExec(
   }
 
   override def requiredChildDistribution: Seq[Distribution] =
-    ClusteredDistribution(leftKeys) :: ClusteredDistribution(rightKeys) :: Nil
+    HashClusteredDistribution(leftKeys) :: HashClusteredDistribution(rightKeys) :: Nil
 
   override def outputOrdering: Seq[SortOrder] = joinType match {
     // For inner join, orders of both sides keys should be kept.
@@ -422,10 +422,9 @@ case class SortMergeJoinExec(
    */
   private def genScanner(ctx: CodegenContext): (String, String) = {
     // Create class member for next row from both sides.
-    val leftRow = ctx.freshName("leftRow")
-    ctx.addMutableState("InternalRow", leftRow)
-    val rightRow = ctx.freshName("rightRow")
-    ctx.addMutableState("InternalRow", rightRow, s"$rightRow = null;")
+    // Inline mutable state since not many join operations in a task
+    val leftRow = ctx.addMutableState("InternalRow", "leftRow", forceInline = true)
+    val rightRow = ctx.addMutableState("InternalRow", "rightRow", forceInline = true)
 
     // Create variables for join keys from both sides.
     val leftKeyVars = createJoinKey(ctx, leftRow, leftKeys, left.output)
@@ -436,14 +435,14 @@ case class SortMergeJoinExec(
     val rightKeyVars = copyKeys(ctx, rightKeyTmpVars)
 
     // A list to hold all matched rows from right side.
-    val matches = ctx.freshName("matches")
     val clsName = classOf[ExternalAppendOnlyUnsafeRowArray].getName
 
     val spillThreshold = getSpillThreshold
     val inMemoryThreshold = getInMemoryThreshold
 
-    ctx.addMutableState(clsName, matches,
-      s"$matches = new $clsName($inMemoryThreshold, $spillThreshold);")
+    // Inline mutable state since not many join operations in a task
+    val matches = ctx.addMutableState(clsName, "matches",
+      v => s"$v = new $clsName($inMemoryThreshold, $spillThreshold);", forceInline = true)
     // Copy the left keys as class members so they could be used in next function call.
     val matchedKeyVars = copyKeys(ctx, leftKeyVars)
 
@@ -495,7 +494,7 @@ case class SortMergeJoinExec(
          |        $leftRow = null;
          |      } else {
          |        $matches.add((UnsafeRow) $rightRow);
-         |        $rightRow = null;;
+         |        $rightRow = null;
          |      }
          |    } while ($leftRow != null);
          |  }
@@ -517,13 +516,13 @@ case class SortMergeJoinExec(
     ctx.INPUT_ROW = leftRow
     left.output.zipWithIndex.map { case (a, i) =>
       val value = ctx.freshName("value")
-      val valueCode = ctx.getValue(leftRow, a.dataType, i.toString)
-      val javaType = ctx.javaType(a.dataType)
-      val defaultValue = ctx.defaultValue(a.dataType)
+      val valueCode = CodeGenerator.getValue(leftRow, a.dataType, i.toString)
+      val javaType = CodeGenerator.javaType(a.dataType)
+      val defaultValue = CodeGenerator.defaultValue(a.dataType)
       if (a.nullable) {
         val isNull = ctx.freshName("isNull")
         val code =
-          s"""
+          code"""
              |$isNull = $leftRow.isNullAt($i);
              |$value = $isNull ? $defaultValue : ($valueCode);
            """.stripMargin
@@ -532,11 +531,12 @@ case class SortMergeJoinExec(
              |boolean $isNull = false;
              |$javaType $value = $defaultValue;
            """.stripMargin
-        (ExprCode(code, isNull, value), leftVarsDecl)
+        (ExprCode(code, JavaCode.isNullVariable(isNull), JavaCode.variable(value, a.dataType)),
+          leftVarsDecl)
       } else {
-        val code = s"$value = $valueCode;"
+        val code = code"$value = $valueCode;"
         val leftVarsDecl = s"""$javaType $value = $defaultValue;"""
-        (ExprCode(code, "false", value), leftVarsDecl)
+        (ExprCode(code, FalseLiteral, JavaCode.variable(value, a.dataType)), leftVarsDecl)
       }
     }.unzip
   }
@@ -578,10 +578,11 @@ case class SortMergeJoinExec(
   override def needCopyResult: Boolean = true
 
   override def doProduce(ctx: CodegenContext): String = {
-    val leftInput = ctx.freshName("leftInput")
-    ctx.addMutableState("scala.collection.Iterator", leftInput, s"$leftInput = inputs[0];")
-    val rightInput = ctx.freshName("rightInput")
-    ctx.addMutableState("scala.collection.Iterator", rightInput, s"$rightInput = inputs[1];")
+    // Inline mutable state since not many join operations in a task
+    val leftInput = ctx.addMutableState("scala.collection.Iterator", "leftInput",
+      v => s"$v = inputs[0];", forceInline = true)
+    val rightInput = ctx.addMutableState("scala.collection.Iterator", "rightInput",
+      v => s"$v = inputs[1];", forceInline = true)
 
     val (leftRow, matches) = genScanner(ctx)
 

@@ -17,16 +17,20 @@
 
 package org.apache.spark.sql.execution.datasources.orc
 
+import java.nio.charset.StandardCharsets.UTF_8
+import java.util.Locale
+
 import scala.collection.JavaConverters._
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
-import org.apache.orc.{OrcFile, TypeDescription}
+import org.apache.orc.{OrcFile, Reader, TypeDescription, Writer}
 
+import org.apache.spark.{SPARK_VERSION_SHORT, SparkException}
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.analysis.{caseInsensitiveResolution, caseSensitiveResolution}
+import org.apache.spark.sql.{SPARK_VERSION_METADATA_KEY, SparkSession}
+import org.apache.spark.sql.catalyst.analysis.caseSensitiveResolution
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
 
@@ -50,25 +54,38 @@ object OrcUtils extends Logging {
     paths
   }
 
-  def readSchema(file: Path, conf: Configuration): Option[TypeDescription] = {
+  def readSchema(file: Path, conf: Configuration, ignoreCorruptFiles: Boolean)
+      : Option[TypeDescription] = {
     val fs = file.getFileSystem(conf)
     val readerOptions = OrcFile.readerOptions(conf).filesystem(fs)
-    val reader = OrcFile.createReader(file, readerOptions)
-    val schema = reader.getSchema
-    if (schema.getFieldNames.size == 0) {
-      None
-    } else {
-      Some(schema)
+    try {
+      val reader = OrcFile.createReader(file, readerOptions)
+      val schema = reader.getSchema
+      if (schema.getFieldNames.size == 0) {
+        None
+      } else {
+        Some(schema)
+      }
+    } catch {
+      case e: org.apache.orc.FileFormatException =>
+        if (ignoreCorruptFiles) {
+          logWarning(s"Skipped the footer in the corrupted file: $file", e)
+          None
+        } else {
+          throw new SparkException(s"Could not read footer for file: $file", e)
+        }
     }
   }
 
   def readSchema(sparkSession: SparkSession, files: Seq[FileStatus])
       : Option[StructType] = {
+    val ignoreCorruptFiles = sparkSession.sessionState.conf.ignoreCorruptFiles
     val conf = sparkSession.sessionState.newHadoopConf()
     // TODO: We need to support merge schema. Please see SPARK-11412.
-    files.map(_.getPath).flatMap(readSchema(_, conf)).headOption.map { schema =>
-      logDebug(s"Reading schema from file $files, got Hive schema string: $schema")
-      CatalystSqlParser.parseDataType(schema.toString).asInstanceOf[StructType]
+    files.toIterator.map(file => readSchema(file.getPath, conf, ignoreCorruptFiles)).collectFirst {
+      case Some(schema) =>
+        logDebug(s"Reading schema from file $files, got Hive schema string: $schema")
+        CatalystSqlParser.parseDataType(schema.toString).asInstanceOf[StructType]
     }
   }
 
@@ -80,11 +97,8 @@ object OrcUtils extends Logging {
       isCaseSensitive: Boolean,
       dataSchema: StructType,
       requiredSchema: StructType,
-      file: Path,
+      reader: Reader,
       conf: Configuration): Option[Array[Int]] = {
-    val fs = file.getFileSystem(conf)
-    val readerOptions = OrcFile.readerOptions(conf).filesystem(fs)
-    val reader = OrcFile.createReader(file, readerOptions)
     val orcFieldNames = reader.getSchema.getFieldNames.asScala
     if (orcFieldNames.isEmpty) {
       // SPARK-8501: Some old empty ORC files always have an empty schema stored in their footer.
@@ -94,7 +108,7 @@ object OrcUtils extends Logging {
         // This is a ORC file written by Hive, no field names in the physical schema, assume the
         // physical schema maps to the data scheme by index.
         assert(orcFieldNames.length <= dataSchema.length, "The given data schema " +
-          s"${dataSchema.simpleString} has less fields than the actual ORC physical schema, " +
+          s"${dataSchema.catalogString} has less fields than the actual ORC physical schema, " +
           "no idea which columns were dropped, fail to read.")
         Some(requiredSchema.fieldNames.map { name =>
           val index = dataSchema.fieldIndex(name)
@@ -105,9 +119,37 @@ object OrcUtils extends Logging {
           }
         })
       } else {
-        val resolver = if (isCaseSensitive) caseSensitiveResolution else caseInsensitiveResolution
-        Some(requiredSchema.fieldNames.map { name => orcFieldNames.indexWhere(resolver(_, name)) })
+        if (isCaseSensitive) {
+          Some(requiredSchema.fieldNames.map { name =>
+            orcFieldNames.indexWhere(caseSensitiveResolution(_, name))
+          })
+        } else {
+          // Do case-insensitive resolution only if in case-insensitive mode
+          val caseInsensitiveOrcFieldMap =
+            orcFieldNames.zipWithIndex.groupBy(_._1.toLowerCase(Locale.ROOT))
+          Some(requiredSchema.fieldNames.map { requiredFieldName =>
+            caseInsensitiveOrcFieldMap
+              .get(requiredFieldName.toLowerCase(Locale.ROOT))
+              .map { matchedOrcFields =>
+                if (matchedOrcFields.size > 1) {
+                  // Need to fail if there is ambiguity, i.e. more than one field is matched.
+                  val matchedOrcFieldsString = matchedOrcFields.map(_._1).mkString("[", ", ", "]")
+                  throw new RuntimeException(s"""Found duplicate field(s) "$requiredFieldName": """
+                    + s"$matchedOrcFieldsString in case-insensitive mode")
+                } else {
+                  matchedOrcFields.head._2
+                }
+              }.getOrElse(-1)
+          })
+        }
       }
     }
+  }
+
+  /**
+   * Add a metadata specifying Spark version.
+   */
+  def addSparkVersionMetadata(writer: Writer): Unit = {
+    writer.addUserMetadata(SPARK_VERSION_METADATA_KEY, UTF_8.encode(SPARK_VERSION_SHORT))
   }
 }

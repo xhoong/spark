@@ -24,20 +24,17 @@ import scala.collection.JavaConverters._
 
 import org.apache.spark.{JobExecutionStatus, SparkConf}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.Status._
 import org.apache.spark.scheduler._
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.metric._
-import org.apache.spark.status.LiveEntity
-import org.apache.spark.status.config._
-import org.apache.spark.ui.SparkUI
-import org.apache.spark.util.kvstore.KVStore
+import org.apache.spark.sql.internal.StaticSQLConf._
+import org.apache.spark.status.{ElementTrackingStore, KVUtils, LiveEntity}
 
-private[sql] class SQLAppStatusListener(
+class SQLAppStatusListener(
     conf: SparkConf,
-    kvstore: KVStore,
-    live: Boolean,
-    ui: Option[SparkUI] = None)
-  extends SparkListener with Logging {
+    kvstore: ElementTrackingStore,
+    live: Boolean) extends SparkListener with Logging {
 
   // How often to flush intermediate state of a live execution to the store. When replaying logs,
   // never flush (only do the very last write).
@@ -49,7 +46,27 @@ private[sql] class SQLAppStatusListener(
   private val liveExecutions = new ConcurrentHashMap[Long, LiveExecutionData]()
   private val stageMetrics = new ConcurrentHashMap[Int, LiveStageMetrics]()
 
-  private var uiInitialized = false
+  // Returns true if this listener has no live data. Exposed for tests only.
+  private[sql] def noLiveData(): Boolean = {
+    liveExecutions.isEmpty && stageMetrics.isEmpty
+  }
+
+  kvstore.addTrigger(classOf[SQLExecutionUIData], conf.get(UI_RETAINED_EXECUTIONS)) { count =>
+    cleanupExecutions(count)
+  }
+
+  kvstore.onFlush {
+    if (!live) {
+      val now = System.nanoTime()
+      liveExecutions.values.asScala.foreach { exec =>
+        // This saves the partial aggregated metrics to the store; this works currently because
+        // when the SHS sees an updated event log, all old data for the application is thrown
+        // away.
+        exec.metricsValues = aggregateMetrics(exec)
+        exec.write(kvstore, now)
+      }
+    }
+  }
 
   override def onJobStart(event: SparkListenerJobStart): Unit = {
     val executionIdString = event.properties.getProperty(SQLExecution.EXECUTION_ID_KEY)
@@ -64,14 +81,14 @@ private[sql] class SQLAppStatusListener(
 
     // Record the accumulator IDs for the stages of this job, so that the code that keeps
     // track of the metrics knows which accumulators to look at.
-    val accumIds = exec.metrics.map(_.accumulatorId).sorted.toList
+    val accumIds = exec.metrics.map(_.accumulatorId).toSet
     event.stageIds.foreach { id =>
-      stageMetrics.put(id, new LiveStageMetrics(id, 0, accumIds.toArray, new ConcurrentHashMap()))
+      stageMetrics.put(id, new LiveStageMetrics(id, 0, accumIds, new ConcurrentHashMap()))
     }
 
     exec.jobs = exec.jobs + (jobId -> JobExecutionStatus.RUNNING)
-    exec.stages = event.stageIds.toSet
-    update(exec)
+    exec.stages ++= event.stageIds.toSet
+    update(exec, force = true)
   }
 
   override def onStageSubmitted(event: SparkListenerStageSubmitted): Unit = {
@@ -82,7 +99,7 @@ private[sql] class SQLAppStatusListener(
     // Reset the metrics tracking object for the new attempt.
     Option(stageMetrics.get(event.stageInfo.stageId)).foreach { metrics =>
       metrics.taskMetrics.clear()
-      metrics.attemptId = event.stageInfo.attemptId
+      metrics.attemptId = event.stageInfo.attemptNumber
     }
   }
 
@@ -142,7 +159,6 @@ private[sql] class SQLAppStatusListener(
   }
 
   private def aggregateMetrics(exec: LiveExecutionData): Map[Long, String] = {
-    val metricIds = exec.metrics.map(_.accumulatorId).sorted
     val metricTypes = exec.metrics.map { m => (m.accumulatorId, m.metricType) }.toMap
     val metrics = exec.stages.toSeq
       .flatMap { stageId => Option(stageMetrics.get(stageId)) }
@@ -150,15 +166,15 @@ private[sql] class SQLAppStatusListener(
       .flatMap { metrics => metrics.ids.zip(metrics.values) }
 
     val aggregatedMetrics = (metrics ++ exec.driverAccumUpdates.toSeq)
-      .filter { case (id, _) => metricIds.contains(id) }
+      .filter { case (id, _) => metricTypes.contains(id) }
       .groupBy(_._1)
       .map { case (id, values) =>
-        id -> SQLMetrics.stringValue(metricTypes(id), values.map(_._2).toSeq)
+        id -> SQLMetrics.stringValue(metricTypes(id), values.map(_._2))
       }
 
     // Check the execution again for whether the aggregated metrics data has been calculated.
     // This can happen if the UI is requesting this data, and the onExecutionEnd handler is
-    // running at the same time. The metrics calculcated for the UI can be innacurate in that
+    // running at the same time. The metrics calculated for the UI can be innacurate in that
     // case, since the onExecutionEnd handler will clean up tracked stage metrics.
     if (exec.metricsValues != null) {
       exec.metricsValues
@@ -212,14 +228,6 @@ private[sql] class SQLAppStatusListener(
   }
 
   private def onExecutionStart(event: SparkListenerSQLExecutionStart): Unit = {
-    // Install the SQL tab in a live app if it hasn't been initialized yet.
-    if (!uiInitialized) {
-      ui.foreach { _ui =>
-        new SQLTab(new SQLAppStatusStore(kvstore, Some(this)), _ui)
-      }
-      uiInitialized = true
-    }
-
     val SparkListenerSQLExecutionStart(executionId, description, details,
       physicalPlanDescription, sparkPlanInfo, time) = event
 
@@ -280,7 +288,7 @@ private[sql] class SQLAppStatusListener(
   private def onDriverAccumUpdates(event: SparkListenerDriverAccumUpdates): Unit = {
     val SparkListenerDriverAccumUpdates(executionId, accumUpdates) = event
     Option(liveExecutions.get(executionId)).foreach { exec =>
-      exec.driverAccumUpdates = accumUpdates.toMap
+      exec.driverAccumUpdates = exec.driverAccumUpdates ++ accumUpdates
       update(exec)
     }
   }
@@ -299,11 +307,13 @@ private[sql] class SQLAppStatusListener(
       })
   }
 
-  private def update(exec: LiveExecutionData): Unit = {
+  private def update(exec: LiveExecutionData, force: Boolean = false): Unit = {
     val now = System.nanoTime()
     if (exec.endEvents >= exec.jobs.size + 1) {
       exec.write(kvstore, now)
       liveExecutions.remove(exec.executionId)
+    } else if (force) {
+      exec.write(kvstore, now)
     } else if (liveUpdatePeriodNs >= 0) {
       if (now - exec.lastWriteTime > liveUpdatePeriodNs) {
         exec.write(kvstore, now)
@@ -314,6 +324,20 @@ private[sql] class SQLAppStatusListener(
   private def isSQLStage(stageId: Int): Boolean = {
     liveExecutions.values().asScala.exists { exec =>
       exec.stages.contains(stageId)
+    }
+  }
+
+  private def cleanupExecutions(count: Long): Unit = {
+    val countToDelete = count - conf.get(UI_RETAINED_EXECUTIONS)
+    if (countToDelete <= 0) {
+      return
+    }
+
+    val view = kvstore.view(classOf[SQLExecutionUIData]).index("completionTime").first(0L)
+    val toDelete = KVUtils.viewToSeq(view, countToDelete.toInt)(_.completionTime.isDefined)
+    toDelete.foreach { e =>
+      kvstore.delete(e.getClass(), e.executionId)
+      kvstore.delete(classOf[SparkPlanGraphWrapper], e.executionId)
     }
   }
 
@@ -357,10 +381,10 @@ private class LiveExecutionData(val executionId: Long) extends LiveEntity {
 private class LiveStageMetrics(
     val stageId: Int,
     var attemptId: Int,
-    val accumulatorIds: Array[Long],
+    val accumulatorIds: Set[Long],
     val taskMetrics: ConcurrentHashMap[Long, LiveTaskMetrics])
 
-private[sql] class LiveTaskMetrics(
+private class LiveTaskMetrics(
     val ids: Array[Long],
     val values: Array[Long],
     val succeeded: Boolean)

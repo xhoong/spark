@@ -38,6 +38,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.execution.datasources._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
 import org.apache.spark.util.SerializableConfiguration
@@ -57,6 +58,19 @@ private[sql] object OrcFileFormat {
 
   def checkFieldNames(names: Seq[String]): Unit = {
     names.foreach(checkFieldName)
+  }
+
+  def getQuotedSchemaString(dataType: DataType): String = dataType match {
+    case _: AtomicType => dataType.catalogString
+    case StructType(fields) =>
+      fields.map(f => s"`${f.name}`:${getQuotedSchemaString(f.dataType)}")
+        .mkString("struct<", ",", ">")
+    case ArrayType(elementType, _) =>
+      s"array<${getQuotedSchemaString(elementType)}>"
+    case MapType(keyType, valueType, _) =>
+      s"map<${getQuotedSchemaString(keyType)},${getQuotedSchemaString(valueType)}>"
+    case _ => // UDT and others
+      dataType.catalogString
   }
 }
 
@@ -92,7 +106,7 @@ class OrcFileFormat
 
     val conf = job.getConfiguration
 
-    conf.set(MAPRED_OUTPUT_SCHEMA.getAttribute, dataSchema.catalogString)
+    conf.set(MAPRED_OUTPUT_SCHEMA.getAttribute, OrcFileFormat.getQuotedSchemaString(dataSchema))
 
     conf.set(COMPRESS.getAttribute, orcOptions.compressionCodec)
 
@@ -118,6 +132,13 @@ class OrcFileFormat
     }
   }
 
+  override def supportBatch(sparkSession: SparkSession, schema: StructType): Boolean = {
+    val conf = sparkSession.sessionState.conf
+    conf.orcVectorizedReaderEnabled && conf.wholeStageEnabled &&
+      schema.length <= conf.wholeStageMaxNumFields &&
+      schema.forall(_.dataType.isInstanceOf[AtomicType])
+  }
+
   override def isSplitable(
       sparkSession: SparkSession,
       options: Map[String, String],
@@ -139,6 +160,13 @@ class OrcFileFormat
       }
     }
 
+    val resultSchema = StructType(requiredSchema.fields ++ partitionSchema.fields)
+    val sqlConf = sparkSession.sessionState.conf
+    val enableOffHeapColumnVector = sqlConf.offHeapColumnVectorEnabled
+    val enableVectorizedReader = supportBatch(sparkSession, resultSchema)
+    val capacity = sqlConf.orcVectorizedReaderBatchSize
+    val copyToSpark = sparkSession.sessionState.conf.getConf(SQLConf.ORC_COPY_BATCH_TO_SPARK)
+
     val broadcastedConf =
       sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
     val isCaseSensitive = sparkSession.sessionState.conf.caseSensitiveAnalysis
@@ -146,8 +174,14 @@ class OrcFileFormat
     (file: PartitionedFile) => {
       val conf = broadcastedConf.value.value
 
+      val filePath = new Path(new URI(file.filePath))
+
+      val fs = filePath.getFileSystem(conf)
+      val readerOptions = OrcFile.readerOptions(conf).filesystem(fs)
+      val reader = OrcFile.createReader(filePath, readerOptions)
+
       val requestedColIdsOrEmptyFile = OrcUtils.requestedColumnIds(
-        isCaseSensitive, dataSchema, requiredSchema, new Path(new URI(file.filePath)), conf)
+        isCaseSensitive, dataSchema, requiredSchema, reader, conf)
 
       if (requestedColIdsOrEmptyFile.isEmpty) {
         Iterator.empty
@@ -155,31 +189,69 @@ class OrcFileFormat
         val requestedColIds = requestedColIdsOrEmptyFile.get
         assert(requestedColIds.length == requiredSchema.length,
           "[BUG] requested column IDs do not match required schema")
-        conf.set(OrcConf.INCLUDE_COLUMNS.getAttribute,
+        val taskConf = new Configuration(conf)
+        taskConf.set(OrcConf.INCLUDE_COLUMNS.getAttribute,
           requestedColIds.filter(_ != -1).sorted.mkString(","))
 
-        val fileSplit =
-          new FileSplit(new Path(new URI(file.filePath)), file.start, file.length, Array.empty)
+        val fileSplit = new FileSplit(filePath, file.start, file.length, Array.empty)
         val attemptId = new TaskAttemptID(new TaskID(new JobID(), TaskType.MAP, 0), 0)
-        val taskAttemptContext = new TaskAttemptContextImpl(conf, attemptId)
+        val taskAttemptContext = new TaskAttemptContextImpl(taskConf, attemptId)
 
-        val orcRecordReader = new OrcInputFormat[OrcStruct]
-          .createRecordReader(fileSplit, taskAttemptContext)
-        val iter = new RecordReaderIterator[OrcStruct](orcRecordReader)
-        Option(TaskContext.get()).foreach(_.addTaskCompletionListener(_ => iter.close()))
+        val taskContext = Option(TaskContext.get())
+        if (enableVectorizedReader) {
+          val batchReader = new OrcColumnarBatchReader(
+            enableOffHeapColumnVector && taskContext.isDefined, copyToSpark, capacity)
+          // SPARK-23399 Register a task completion listener first to call `close()` in all cases.
+          // There is a possibility that `initialize` and `initBatch` hit some errors (like OOM)
+          // after opening a file.
+          val iter = new RecordReaderIterator(batchReader)
+          Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => iter.close()))
 
-        val fullSchema = requiredSchema.toAttributes ++ partitionSchema.toAttributes
-        val unsafeProjection = GenerateUnsafeProjection.generate(fullSchema, fullSchema)
-        val deserializer = new OrcDeserializer(dataSchema, requiredSchema, requestedColIds)
+          batchReader.initialize(fileSplit, taskAttemptContext)
+          batchReader.initBatch(
+            reader.getSchema,
+            requestedColIds,
+            requiredSchema.fields,
+            partitionSchema,
+            file.partitionValues)
 
-        if (partitionSchema.length == 0) {
-          iter.map(value => unsafeProjection(deserializer.deserialize(value)))
+          iter.asInstanceOf[Iterator[InternalRow]]
         } else {
-          val joinedRow = new JoinedRow()
-          iter.map(value =>
-            unsafeProjection(joinedRow(deserializer.deserialize(value), file.partitionValues)))
+          val orcRecordReader = new OrcInputFormat[OrcStruct]
+            .createRecordReader(fileSplit, taskAttemptContext)
+          val iter = new RecordReaderIterator[OrcStruct](orcRecordReader)
+          Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => iter.close()))
+
+          val fullSchema = requiredSchema.toAttributes ++ partitionSchema.toAttributes
+          val unsafeProjection = GenerateUnsafeProjection.generate(fullSchema, fullSchema)
+          val deserializer = new OrcDeserializer(dataSchema, requiredSchema, requestedColIds)
+
+          if (partitionSchema.length == 0) {
+            iter.map(value => unsafeProjection(deserializer.deserialize(value)))
+          } else {
+            val joinedRow = new JoinedRow()
+            iter.map(value =>
+              unsafeProjection(joinedRow(deserializer.deserialize(value), file.partitionValues)))
+          }
         }
       }
     }
+  }
+
+  override def supportDataType(dataType: DataType, isReadPath: Boolean): Boolean = dataType match {
+    case _: AtomicType => true
+
+    case st: StructType => st.forall { f => supportDataType(f.dataType, isReadPath) }
+
+    case ArrayType(elementType, _) => supportDataType(elementType, isReadPath)
+
+    case MapType(keyType, valueType, _) =>
+      supportDataType(keyType, isReadPath) && supportDataType(valueType, isReadPath)
+
+    case udt: UserDefinedType[_] => supportDataType(udt.sqlType, isReadPath)
+
+    case _: NullType => isReadPath
+
+    case _ => false
   }
 }

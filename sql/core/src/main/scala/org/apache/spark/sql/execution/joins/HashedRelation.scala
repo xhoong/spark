@@ -24,7 +24,7 @@ import com.esotericsoftware.kryo.io.{Input, Output}
 
 import org.apache.spark.{SparkConf, SparkEnv, SparkException}
 import org.apache.spark.internal.config.MEMORY_OFFHEAP_ENABLED
-import org.apache.spark.memory.{MemoryConsumer, StaticMemoryManager, TaskMemoryManager}
+import org.apache.spark.memory._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.physical.BroadcastMode
@@ -316,7 +316,9 @@ private[joins] object UnsafeHashedRelation {
           row.getBaseObject, row.getBaseOffset, row.getSizeInBytes)
         if (!success) {
           binaryMap.free()
-          throw new SparkException("There is no enough memory to build hash map")
+          // scalastyle:off throwerror
+          throw new SparkOutOfMemoryError("There is no enough memory to build hash map")
+          // scalastyle:on throwerror
         }
       }
     }
@@ -368,7 +370,7 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   // The minimum key
   private var minKey = Long.MaxValue
 
-  // The maxinum key
+  // The maximum key
   private var maxKey = Long.MinValue
 
   // The array to store the key and offset of UnsafeRow in the page.
@@ -557,7 +559,7 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   def append(key: Long, row: UnsafeRow): Unit = {
     val sizeInBytes = row.getSizeInBytes
     if (sizeInBytes >= (1 << SIZE_BITS)) {
-      sys.error("Does not support row that is larger than 256M")
+      throw new UnsupportedOperationException("Does not support row that is larger than 256M")
     }
 
     if (key < minKey) {
@@ -567,19 +569,7 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
       maxKey = key
     }
 
-    // There is 8 bytes for the pointer to next value
-    if (cursor + 8 + row.getSizeInBytes > page.length * 8L + Platform.LONG_ARRAY_OFFSET) {
-      val used = page.length
-      if (used >= (1 << 30)) {
-        sys.error("Can not build a HashedRelation that is larger than 8G")
-      }
-      ensureAcquireMemory(used * 8L * 2)
-      val newPage = new Array[Long](used * 2)
-      Platform.copyMemory(page, Platform.LONG_ARRAY_OFFSET, newPage, Platform.LONG_ARRAY_OFFSET,
-        cursor - Platform.LONG_ARRAY_OFFSET)
-      page = newPage
-      freeMemory(used * 8L)
-    }
+    grow(row.getSizeInBytes)
 
     // copy the bytes of UnsafeRow
     val offset = cursor
@@ -615,7 +605,8 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
           growArray()
         } else if (numKeys > array.length / 2 * 0.75) {
           // The fill ratio should be less than 0.75
-          sys.error("Cannot build HashedRelation with more than 1/3 billions unique keys")
+          throw new UnsupportedOperationException(
+            "Cannot build HashedRelation with more than 1/3 billions unique keys")
         }
       }
     } else {
@@ -623,6 +614,25 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
       val pointer = toOffset(address) + toSize(address)
       Platform.putLong(page, pointer, array(pos + 1))
       array(pos + 1) = address
+    }
+  }
+
+  private def grow(inputRowSize: Int): Unit = {
+    // There is 8 bytes for the pointer to next value
+    val neededNumWords = (cursor - Platform.LONG_ARRAY_OFFSET + 8 + inputRowSize + 7) / 8
+    if (neededNumWords > page.length) {
+      if (neededNumWords > (1 << 30)) {
+        throw new UnsupportedOperationException(
+          "Can not build a HashedRelation that is larger than 8G")
+      }
+      val newNumWords = math.max(neededNumWords, math.min(page.length * 2, 1 << 30))
+      ensureAcquireMemory(newNumWords * 8L)
+      val newPage = new Array[Long](newNumWords.toInt)
+      Platform.copyMemory(page, Platform.LONG_ARRAY_OFFSET, newPage, Platform.LONG_ARRAY_OFFSET,
+        cursor - Platform.LONG_ARRAY_OFFSET)
+      val used = page.length
+      page = newPage
+      freeMemory(used * 8L)
     }
   }
 
@@ -764,6 +774,8 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
     array = readLongArray(readBuffer, length)
     val pageLength = readLong().toInt
     page = readLongArray(readBuffer, pageLength)
+    // Restore cursor variable to make this map able to be serialized again on executors.
+    cursor = pageLength * 8 + Platform.LONG_ARRAY_OFFSET
   }
 
   override def readExternal(in: ObjectInput): Unit = {

@@ -65,7 +65,7 @@ private[spark] class SparkUI private (
     attachTab(new StorageTab(this, store))
     attachTab(new EnvironmentTab(this, store))
     attachTab(new ExecutorsTab(this))
-    attachHandler(createStaticHandler(SparkUI.STATIC_RESOURCE_DIR, "/static"))
+    addStaticHandler(SparkUI.STATIC_RESOURCE_DIR)
     attachHandler(createRedirectHandler("/", "/jobs/", basePath = basePath))
     attachHandler(ApiRootResource.getServletHandler(this))
 
@@ -154,8 +154,6 @@ private[spark] object SparkUI {
   val DEFAULT_PORT = 4040
   val STATIC_RESOURCE_DIR = "org/apache/spark/ui/static"
   val DEFAULT_POOL_NAME = "default"
-  val DEFAULT_RETAINED_STAGES = 1000
-  val DEFAULT_RETAINED_JOBS = 1000
 
   def getUIPort(conf: SparkConf): Int = {
     conf.getInt("spark.ui.port", SparkUI.DEFAULT_PORT)
