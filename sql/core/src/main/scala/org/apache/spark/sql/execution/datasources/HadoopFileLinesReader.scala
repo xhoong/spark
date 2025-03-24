@@ -18,14 +18,14 @@
 package org.apache.spark.sql.execution.datasources
 
 import java.io.Closeable
-import java.net.URI
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
 import org.apache.hadoop.io.Text
 import org.apache.hadoop.mapreduce._
 import org.apache.hadoop.mapreduce.lib.input.{FileSplit, LineRecordReader}
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
+
+import org.apache.spark.util.Utils
 
 /**
  * An adaptor from a [[PartitionedFile]] to an [[Iterator]] of [[Text]], which are all of the lines
@@ -46,29 +46,31 @@ class HadoopFileLinesReader(
 
   def this(file: PartitionedFile, conf: Configuration) = this(file, None, conf)
 
-  private val iterator = {
+  private val _iterator = {
     val fileSplit = new FileSplit(
-      new Path(new URI(file.filePath)),
+      file.toPath,
       file.start,
       file.length,
-      // TODO: Implement Locality
+      // The locality is decided by `getPreferredLocations` in `FileScanRDD`.
       Array.empty)
     val attemptId = new TaskAttemptID(new TaskID(new JobID(), TaskType.MAP, 0), 0)
     val hadoopAttemptContext = new TaskAttemptContextImpl(conf, attemptId)
 
-    val reader = lineSeparator match {
-      case Some(sep) => new LineRecordReader(sep)
-      // If the line separator is `None`, it covers `\r`, `\r\n` and `\n`.
-      case _ => new LineRecordReader()
+    Utils.tryInitializeResource(
+      lineSeparator match {
+        case Some(sep) => new LineRecordReader(sep)
+        // If the line separator is `None`, it covers `\r`, `\r\n` and `\n`.
+        case _ => new LineRecordReader()
+      }
+    ) { reader =>
+      reader.initialize(fileSplit, hadoopAttemptContext)
+      new RecordReaderIterator(reader)
     }
-
-    reader.initialize(fileSplit, hadoopAttemptContext)
-    new RecordReaderIterator(reader)
   }
 
-  override def hasNext: Boolean = iterator.hasNext
+  override def hasNext: Boolean = _iterator.hasNext
 
-  override def next(): Text = iterator.next()
+  override def next(): Text = _iterator.next()
 
-  override def close(): Unit = iterator.close()
+  override def close(): Unit = _iterator.close()
 }

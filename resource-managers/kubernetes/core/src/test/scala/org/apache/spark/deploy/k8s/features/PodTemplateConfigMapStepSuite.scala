@@ -16,40 +16,50 @@
  */
 package org.apache.spark.deploy.k8s.features
 
-import java.io.{File, PrintWriter}
+import java.io.PrintWriter
 import java.nio.file.Files
 
 import io.fabric8.kubernetes.api.model.ConfigMap
-import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.deploy.k8s._
+import org.apache.spark.deploy.k8s.Constants._
+import org.apache.spark.util.Utils
 
-class PodTemplateConfigMapStepSuite extends SparkFunSuite with BeforeAndAfter {
-  private var kubernetesConf : KubernetesConf = _
-  private var templateFile: File = _
+class PodTemplateConfigMapStepSuite extends SparkFunSuite {
 
-  before {
-    templateFile = Files.createTempFile("pod-template", "yml").toFile
+  test("Do nothing when executor template is not specified") {
+    val conf = KubernetesTestConf.createDriverConf()
+    val step = new PodTemplateConfigMapStep(conf)
+
+    val initialPod = SparkPod.initialPod()
+    val configuredPod = step.configurePod(initialPod)
+    assert(configuredPod === initialPod)
+
+    assert(step.getAdditionalKubernetesResources().isEmpty)
+    assert(step.getAdditionalPodSystemProperties().isEmpty)
+  }
+
+  test("Mounts executor template volume if config specified") {
+    val templateFile = Files.createTempFile("pod-template", "yml").toFile
     templateFile.deleteOnExit()
 
     val sparkConf = new SparkConf(false)
       .set(Config.KUBERNETES_EXECUTOR_PODTEMPLATE_FILE, templateFile.getAbsolutePath)
-    kubernetesConf = KubernetesTestConf.createDriverConf(sparkConf = sparkConf)
-  }
+    val kubernetesConf = KubernetesTestConf.createDriverConf(sparkConf = sparkConf)
 
-  test("Mounts executor template volume if config specified") {
-    val writer = new PrintWriter(templateFile)
-    writer.write("pod-template-contents")
-    writer.close()
+    Utils.tryWithResource(new PrintWriter(templateFile)) { writer =>
+      writer.write("pod-template-contents")
+    }
 
     val step = new PodTemplateConfigMapStep(kubernetesConf)
     val configuredPod = step.configurePod(SparkPod.initialPod())
 
     assert(configuredPod.pod.getSpec.getVolumes.size() === 1)
     val volume = configuredPod.pod.getSpec.getVolumes.get(0)
+    val generatedResourceName = s"${kubernetesConf.resourceNamePrefix}-$POD_TEMPLATE_CONFIGMAP"
     assert(volume.getName === Constants.POD_TEMPLATE_VOLUME)
-    assert(volume.getConfigMap.getName === Constants.POD_TEMPLATE_CONFIGMAP)
+    assert(volume.getConfigMap.getName === generatedResourceName)
     assert(volume.getConfigMap.getItems.size() === 1)
     assert(volume.getConfigMap.getItems.get(0).getKey === Constants.POD_TEMPLATE_KEY)
     assert(volume.getConfigMap.getItems.get(0).getPath ===
@@ -62,10 +72,11 @@ class PodTemplateConfigMapStepSuite extends SparkFunSuite with BeforeAndAfter {
 
     val resources = step.getAdditionalKubernetesResources()
     assert(resources.size === 1)
-    assert(resources.head.getMetadata.getName === Constants.POD_TEMPLATE_CONFIGMAP)
+    assert(resources.head.getMetadata.getName === generatedResourceName)
     assert(resources.head.isInstanceOf[ConfigMap])
     val configMap = resources.head.asInstanceOf[ConfigMap]
     assert(configMap.getData.size() === 1)
+    assert(configMap.getImmutable())
     assert(configMap.getData.containsKey(Constants.POD_TEMPLATE_KEY))
     assert(configMap.getData.containsValue("pod-template-contents"))
 

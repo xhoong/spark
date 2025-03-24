@@ -26,9 +26,10 @@ import breeze.linalg.{axpy => brzAxpy, inv, svd => brzSvd, DenseMatrix => BDM, D
 import breeze.numerics.{sqrt => brzSqrt}
 
 import org.apache.spark.annotation.Since
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, LogKeys, MDC}
+import org.apache.spark.internal.config.MAX_RESULT_SIZE
 import org.apache.spark.mllib.linalg._
-import org.apache.spark.mllib.stat.{MultivariateOnlineSummarizer, MultivariateStatisticalSummary}
+import org.apache.spark.mllib.stat._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.random.XORShiftRandom
@@ -90,19 +91,39 @@ class RowMatrix @Since("1.0.0") (
   private[mllib] def multiplyGramianMatrixBy(v: BDV[Double]): BDV[Double] = {
     val n = numCols().toInt
     val vbr = rows.context.broadcast(v)
-    rows.treeAggregate(BDV.zeros[Double](n))(
-      seqOp = (U, r) => {
+    rows.treeAggregate[BDV[Double]](
+      zeroValue = null.asInstanceOf[BDV[Double]],
+      seqOp = (U: BDV[Double], r: Vector) => {
         val rBrz = r.asBreeze
         val a = rBrz.dot(vbr.value)
+        val theU =
+          if (U == null) {
+            BDV.zeros[Double](n)
+          } else {
+            U
+          }
         rBrz match {
           // use specialized axpy for better performance
-          case _: BDV[_] => brzAxpy(a, rBrz.asInstanceOf[BDV[Double]], U)
-          case _: BSV[_] => brzAxpy(a, rBrz.asInstanceOf[BSV[Double]], U)
+          case _: BDV[_] => brzAxpy(a, rBrz.asInstanceOf[BDV[Double]], theU)
+          case _: BSV[_] => brzAxpy(a, rBrz.asInstanceOf[BSV[Double]], theU)
           case _ => throw new UnsupportedOperationException(
             s"Do not support vector operation from type ${rBrz.getClass.getName}.")
         }
-        U
-      }, combOp = (U1, U2) => U1 += U2)
+        theU
+      },
+      combOp = (U1: BDV[Double], U2: BDV[Double]) => {
+        if (U1 == null) {
+          U2
+        } else if (U2 == null) {
+          U1
+        } else {
+          U1 += U2
+          U1
+        }
+      },
+      depth = 2,
+      finalAggregateOnExecutor = true
+    )
   }
 
   /**
@@ -117,13 +138,32 @@ class RowMatrix @Since("1.0.0") (
     // Computes n*(n+1)/2, avoiding overflow in the multiplication.
     // This succeeds when n <= 65535, which is checked above
     val nt = if (n % 2 == 0) ((n / 2) * (n + 1)) else (n * ((n + 1) / 2))
+    val gramianSizeInBytes = nt * 8L
 
     // Compute the upper triangular part of the gram matrix.
-    val GU = rows.treeAggregate(new BDV[Double](nt))(
-      seqOp = (U, v) => {
+    val GU = rows.treeAggregate[BDV[Double]](
+      zeroValue = null.asInstanceOf[BDV[Double]],
+      seqOp = (maybeU: BDV[Double], v: Vector) => {
+        val U =
+          if (maybeU == null) {
+            new BDV[Double](nt)
+          } else {
+            maybeU
+          }
         BLAS.spr(1.0, v, U.data)
         U
-      }, combOp = (U1, U2) => U1 += U2)
+      },
+      combOp = (U1: BDV[Double], U2: BDV[Double]) =>
+        if (U1 == null) {
+          U2
+        } else if (U2 == null) {
+          U1
+        } else {
+          U1 += U2
+        },
+      depth = getTreeAggregateIdealDepth(gramianSizeInBytes),
+      finalAggregateOnExecutor = true
+    )
 
     RowMatrix.triuToFull(n, GU.data)
   }
@@ -136,8 +176,15 @@ class RowMatrix @Since("1.0.0") (
     // This succeeds when n <= 65535, which is checked above
     val nt = if (n % 2 == 0) ((n / 2) * (n + 1)) else (n * ((n + 1) / 2))
 
-    val MU = rows.treeAggregate(new BDV[Double](nt))(
-      seqOp = (U, v) => {
+    val MU = rows.treeAggregate[BDV[Double]](
+      zeroValue = null.asInstanceOf[BDV[Double]],
+      seqOp = (maybeU: BDV[Double], v: Vector) => {
+        val U =
+          if (maybeU == null) {
+            new BDV[Double](nt)
+          } else {
+            maybeU
+          }
 
         val n = v.size
         val na = Array.ofDim[Double](n)
@@ -150,7 +197,18 @@ class RowMatrix @Since("1.0.0") (
 
         BLAS.spr(1.0, new DenseVector(na), U.data)
         U
-      }, combOp = (U1, U2) => U1 += U2)
+      },
+      combOp = (U1: BDV[Double], U2: BDV[Double]) =>
+        if (U1 == null) {
+          U2
+        } else if (U2 == null) {
+          U1
+        } else {
+          U1 += U2
+        },
+      depth = 2,
+      finalAggregateOnExecutor = true
+    )
 
     bc.destroy()
 
@@ -205,7 +263,8 @@ class RowMatrix @Since("1.0.0") (
     }
     if (cols > 10000) {
       val memMB = (cols.toLong * cols) / 125000
-      logWarning(s"$cols columns will require at least $memMB megabytes of memory!")
+      logWarning(log"${MDC(LogKeys.NUM_COLUMNS, cols)} columns will require at least " +
+        log"${MDC(LogKeys.MEMORY_SIZE, memMB)} megabytes of memory!")
     }
   }
 
@@ -296,7 +355,8 @@ class RowMatrix @Since("1.0.0") (
     val computeMode = mode match {
       case "auto" =>
         if (k > 5000) {
-          logWarning(s"computing svd with k=$k and n=$n, please check necessity")
+          logWarning(log"computing svd with k=${MDC(LogKeys.NUM_LEADING_SINGULAR_VALUES, k)} and " +
+            log"n=${MDC(LogKeys.NUM_COLUMNS, n)}, please check necessity")
         }
 
         // TODO: The conditions below are not fully tested.
@@ -349,7 +409,8 @@ class RowMatrix @Since("1.0.0") (
     // criterion specified by tol after max number of iterations.
     // Thus use i < min(k, sigmas.length) instead of i < k.
     if (sigmas.length < k) {
-      logWarning(s"Requested $k singular values but only found ${sigmas.length} converged.")
+      logWarning(log"Requested ${MDC(LogKeys.NUM_LEADING_SINGULAR_VALUES, k)} singular " +
+        log"values but only found ${MDC(LogKeys.SIGMAS_LENGTH, sigmas.length)} converged.")
     }
     while (i < math.min(k, sigmas.length) && sigmas(i) >= threshold) {
       i += 1
@@ -357,7 +418,8 @@ class RowMatrix @Since("1.0.0") (
     val sk = i
 
     if (sk < k) {
-      logWarning(s"Requested $k singular values but only found $sk nonzeros.")
+      logWarning(log"Requested ${MDC(LogKeys.NUM_LEADING_SINGULAR_VALUES, k)} singular " +
+        log"values but only found ${MDC(LogKeys.COUNT, sk)} nonzeros.")
     }
 
     // Warn at the end of the run as well, for increased visibility.
@@ -390,6 +452,11 @@ class RowMatrix @Since("1.0.0") (
     }
   }
 
+  // The matrix is sparse, if all the rows has sparsity more than 0.5.
+  private def isSparseMatrix: Boolean = {
+    rows.filter(row => row.sparsity() < 0.5).isEmpty()
+  }
+
   /**
    * Computes the covariance matrix, treating each row as an observation.
    *
@@ -402,13 +469,13 @@ class RowMatrix @Since("1.0.0") (
     val n = numCols().toInt
     checkNumColumns(n)
 
-    val summary = computeColumnSummaryStatistics()
+    val summary = Statistics.colStats(rows.map((_, 1.0)), Seq("count", "mean"))
     val m = summary.count
     require(m > 1, s"RowMatrix.computeCovariance called on matrix with only $m rows." +
       "  Cannot compute the covariance of a RowMatrix with <= 1 row.")
-    val mean = summary.mean
-
-    if (rows.first().isInstanceOf[DenseVector]) {
+    val mean = Vectors.fromML(summary.mean)
+    // If all the rows are sparse vectors, then compute based on `computeSparseVectorCovariance`.
+    if (!isSparseMatrix) {
       computeDenseVectorCovariance(mean, n, m)
     } else {
       computeSparseVectorCovariance(mean, n, m)
@@ -478,9 +545,13 @@ class RowMatrix @Since("1.0.0") (
    */
   @Since("1.0.0")
   def computeColumnSummaryStatistics(): MultivariateStatisticalSummary = {
-    val summary = rows.treeAggregate(new MultivariateOnlineSummarizer)(
-      (aggregator, data) => aggregator.add(data),
-      (aggregator1, aggregator2) => aggregator1.merge(aggregator2))
+    val summary = rows.treeAggregate[MultivariateOnlineSummarizer](
+      zeroValue = new MultivariateOnlineSummarizer,
+      seqOp = (aggregator: MultivariateOnlineSummarizer, data: Vector) => aggregator.add(data),
+      combOp = (aggregator1: MultivariateOnlineSummarizer,
+                aggregator2: MultivariateOnlineSummarizer) => aggregator1.merge(aggregator2),
+      depth = 2,
+      finalAggregateOnExecutor = true)
     updateNumRows(summary.count)
     summary
   }
@@ -574,18 +645,19 @@ class RowMatrix @Since("1.0.0") (
     require(threshold >= 0, s"Threshold cannot be negative: $threshold")
 
     if (threshold > 1) {
-      logWarning(s"Threshold is greater than 1: $threshold " +
-      "Computation will be more efficient with promoted sparsity, " +
-      " however there is no correctness guarantee.")
+      logWarning(log"Threshold is greater than 1: ${MDC(LogKeys.THRESHOLD, threshold)} " +
+        log"Computation will be more efficient with promoted sparsity, " +
+        log"however there is no correctness guarantee.")
     }
 
     val gamma = if (threshold < 1e-6) {
       Double.PositiveInfinity
     } else {
-      10 * math.log(numCols()) / threshold
+      10 * math.log(numCols().toDouble) / threshold
     }
 
-    columnSimilaritiesDIMSUM(computeColumnSummaryStatistics().normL2.toArray, gamma)
+    val summary = Statistics.colStats(rows.map((_, 1.0)), Seq("normL2"))
+    columnSimilaritiesDIMSUM(summary.normL2.toArray, gamma)
   }
 
   /**
@@ -651,7 +723,7 @@ class RowMatrix @Since("1.0.0") (
       colMags: Array[Double],
       gamma: Double): CoordinateMatrix = {
     require(gamma > 1.0, s"Oversampling should be greater than 1: $gamma")
-    require(colMags.size == this.numCols(), "Number of magnitudes didn't match column dimension")
+    require(colMags.length == this.numCols(), "Number of magnitudes didn't match column dimension")
     val sg = math.sqrt(gamma) // sqrt(gamma) used many times
 
     // Don't divide by zero for those columns with zero magnitude
@@ -661,16 +733,16 @@ class RowMatrix @Since("1.0.0") (
     val pBV = sc.broadcast(colMagsCorrected.map(c => sg / c))
     val qBV = sc.broadcast(colMagsCorrected.map(c => math.min(sg, c)))
 
-    val sims = rows.mapPartitionsWithIndex { (indx, iter) =>
+    val sims = rows.mapPartitionsWithIndex { (index, iter) =>
       val p = pBV.value
       val q = qBV.value
 
-      val rand = new XORShiftRandom(indx)
-      val scaled = new Array[Double](p.size)
+      val rand = new XORShiftRandom(index)
+      val scaled = new Array[Double](p.length)
       iter.flatMap { row =>
         row match {
           case SparseVector(size, indices, values) =>
-            val nnz = indices.size
+            val nnz = indices.length
             var k = 0
             while (k < nnz) {
               scaled(k) = values(k) / q(indices(k))
@@ -695,7 +767,7 @@ class RowMatrix @Since("1.0.0") (
               buf
             }.flatten
           case DenseVector(values) =>
-            val n = values.size
+            val n = values.length
             var i = 0
             while (i < n) {
               scaled(i) = values(i) / q(i)
@@ -716,6 +788,8 @@ class RowMatrix @Since("1.0.0") (
               }
               buf
             }.flatten
+          case v =>
+            throw new IllegalArgumentException(s"Unknown vector type ${v.getClass}.")
         }
       }
     }.reduceByKey(_ + _).map { case ((i, j), sim) =>
@@ -730,7 +804,7 @@ class RowMatrix @Since("1.0.0") (
     val mat = BDM.zeros[Double](m, n)
     var i = 0
     rows.collect().foreach { vector =>
-      vector.foreachActive { case (j, v) =>
+      vector.foreachNonZero { case (j, v) =>
         mat(i, j) = v
       }
       i += 1
@@ -739,13 +813,47 @@ class RowMatrix @Since("1.0.0") (
   }
 
   /** Updates or verifies the number of rows. */
-  private def updateNumRows(m: Long) {
+  private def updateNumRows(m: Long): Unit = {
     if (nRows <= 0) {
       nRows = m
     } else {
       require(nRows == m,
         s"The number of rows $m is different from what specified or previously computed: ${nRows}.")
     }
+  }
+
+  /**
+   * Computing desired tree aggregate depth necessary to avoid exceeding
+   * driver.MaxResultSize during aggregation.
+   * Based on the formulae: (numPartitions)^(1/depth) * objectSize <= DriverMaxResultSize
+   * @param aggregatedObjectSizeInBytes the size, in megabytes, of the object being tree aggregated
+   */
+  private[spark] def getTreeAggregateIdealDepth(aggregatedObjectSizeInBytes: Long): Int = {
+    require(aggregatedObjectSizeInBytes > 0,
+      "Cannot compute aggregate depth heuristic based on a zero-size object to aggregate")
+
+    val maxDriverResultSizeInBytes = rows.conf.get[Long](MAX_RESULT_SIZE)
+    if (maxDriverResultSizeInBytes <= 0) {
+      // Unlimited result size, so 1 is OK
+      return 1
+    }
+
+    require(maxDriverResultSizeInBytes > aggregatedObjectSizeInBytes,
+      s"Cannot aggregate object of size $aggregatedObjectSizeInBytes Bytes, "
+        + s"as it's bigger than maxResultSize ($maxDriverResultSizeInBytes Bytes)")
+
+    val numerator = math.log(rows.getNumPartitions)
+    val denominator = math.log(maxDriverResultSizeInBytes.toDouble) -
+      math.log(aggregatedObjectSizeInBytes.toDouble)
+    val desiredTreeDepth = math.ceil(numerator / denominator)
+
+    if (desiredTreeDepth > 4) {
+      logWarning(log"Desired tree depth for treeAggregation is big " +
+        log"(${MDC(LogKeys.DESIRED_TREE_DEPTH, desiredTreeDepth)}). " +
+        log"Consider increasing driver max result size or reducing number of partitions")
+    }
+
+    math.min(math.max(1, desiredTreeDepth), 10).toInt
   }
 }
 

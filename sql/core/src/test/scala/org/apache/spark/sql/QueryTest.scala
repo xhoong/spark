@@ -17,23 +17,27 @@
 
 package org.apache.spark.sql
 
-import java.util.{Locale, TimeZone}
+import java.util.TimeZone
+import java.util.regex.Pattern
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
+import org.scalatest.Assertions
+
+import org.apache.spark.sql.catalyst.ExtendedAnalysisException
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.classic.ClassicConversions._
+import org.apache.spark.sql.execution.{QueryExecution, SQLExecution}
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
+import org.apache.spark.sql.util.QueryExecutionListener
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.ArrayImplicits._
 
 
 abstract class QueryTest extends PlanTest {
 
   protected def spark: SparkSession
-
-  // Timezone is fixed to America/Los_Angeles for those timezone sensitive tests (timestamp_*)
-  TimeZone.setDefault(TimeZone.getTimeZone("America/Los_Angeles"))
-  // Add Locale setting
-  Locale.setDefault(Locale.US)
 
   /**
    * Runs the plan and makes sure the answer contains all of the keywords.
@@ -64,7 +68,7 @@ abstract class QueryTest extends PlanTest {
       expectedAnswer: T*): Unit = {
     val result = getResult(ds)
 
-    if (!compare(result.toSeq, expectedAnswer)) {
+    if (!QueryTest.compare(result.toSeq, expectedAnswer)) {
       fail(
         s"""
            |Decoded objects do not match expected objects:
@@ -84,7 +88,7 @@ abstract class QueryTest extends PlanTest {
       expectedAnswer: T*): Unit = {
     val result = getResult(ds)
 
-    if (!compare(result.toSeq.sorted, expectedAnswer.sorted)) {
+    if (!QueryTest.compare(result.toSeq.sorted, expectedAnswer.sorted)) {
       fail(
         s"""
            |Decoded objects do not match expected objects:
@@ -97,7 +101,7 @@ abstract class QueryTest extends PlanTest {
 
   private def getResult[T](ds: => Dataset[T]): Array[T] = {
     val analyzedDS = try ds catch {
-      case ae: AnalysisException =>
+      case ae: ExtendedAnalysisException =>
         if (ae.plan.isDefined) {
           fail(
             s"""
@@ -124,24 +128,6 @@ abstract class QueryTest extends PlanTest {
     }
   }
 
-  private def compare(obj1: Any, obj2: Any): Boolean = (obj1, obj2) match {
-    case (null, null) => true
-    case (null, _) => false
-    case (_, null) => false
-    case (a: Array[_], b: Array[_]) =>
-      a.length == b.length && a.zip(b).forall { case (l, r) => compare(l, r)}
-    case (a: Iterable[_], b: Iterable[_]) =>
-      a.size == b.size && a.zip(b).forall { case (l, r) => compare(l, r)}
-    case (a: Product, b: Product) =>
-      compare(a.productIterator.toSeq, b.productIterator.toSeq)
-    // 0.0 == -0.0, turn float/double to binary before comparison, to distinguish 0.0 and -0.0.
-    case (a: Double, b: Double) =>
-      java.lang.Double.doubleToRawLongBits(a) == java.lang.Double.doubleToRawLongBits(b)
-    case (a: Float, b: Float) =>
-      java.lang.Float.floatToRawIntBits(a) == java.lang.Float.floatToRawIntBits(b)
-    case (a, b) => a == b
-  }
-
   /**
    * Runs the plan and makes sure the answer matches the expected result.
    *
@@ -150,7 +136,7 @@ abstract class QueryTest extends PlanTest {
    */
   protected def checkAnswer(df: => DataFrame, expectedAnswer: Seq[Row]): Unit = {
     val analyzedDF = try df catch {
-      case ae: AnalysisException =>
+      case ae: ExtendedAnalysisException =>
         if (ae.plan.isDefined) {
           fail(
             s"""
@@ -166,10 +152,7 @@ abstract class QueryTest extends PlanTest {
 
     assertEmptyMissingInput(analyzedDF)
 
-    QueryTest.checkAnswer(analyzedDF, expectedAnswer) match {
-      case Some(errorMessage) => fail(errorMessage)
-      case None =>
-    }
+    QueryTest.checkAnswer(analyzedDF, expectedAnswer)
   }
 
   protected def checkAnswer(df: => DataFrame, expectedAnswer: Row): Unit = {
@@ -177,7 +160,17 @@ abstract class QueryTest extends PlanTest {
   }
 
   protected def checkAnswer(df: => DataFrame, expectedAnswer: DataFrame): Unit = {
-    checkAnswer(df, expectedAnswer.collect())
+    checkAnswer(df, expectedAnswer.collect().toImmutableArraySeq)
+  }
+
+  /**
+   * Runs the plan and makes sure the answer matches the expected result.
+   *
+   * @param df the [[DataFrame]] to be executed
+   * @param expectedAnswer the expected result in a [[Array]] of [[Row]]s.
+   */
+  protected def checkAnswer(df: => DataFrame, expectedAnswer: Array[Row]): Unit = {
+    checkAnswer(df, expectedAnswer.toImmutableArraySeq)
   }
 
   /**
@@ -223,6 +216,23 @@ abstract class QueryTest extends PlanTest {
   }
 
   /**
+   * Asserts that a given [[Dataset]] will be executed using the cache with the given name and
+   * storage level.
+   */
+  def assertCached(query: Dataset[_], cachedName: String, storageLevel: StorageLevel): Unit = {
+    val planWithCaching = query.queryExecution.withCachedData
+    val matched = planWithCaching.exists {
+      case cached: InMemoryRelation =>
+        val cacheBuilder = cached.cacheBuilder
+        cachedName == cacheBuilder.tableName.get && (storageLevel == cacheBuilder.storageLevel)
+      case _ => false
+    }
+
+    assert(matched, s"Expected query plan to hit cache $cachedName with storage " +
+      s"level $storageLevel, but it doesn't.")
+  }
+
+  /**
    * Asserts that a given [[Dataset]] does not have missing inputs in all the analyzed plans.
    */
   def assertEmptyMissingInput(query: Dataset[_]): Unit = {
@@ -233,26 +243,53 @@ abstract class QueryTest extends PlanTest {
     assert(query.queryExecution.executedPlan.missingInput.isEmpty,
       s"The physical plan has missing inputs:\n${query.queryExecution.executedPlan}")
   }
+
+  protected def getCurrentClassCallSitePattern: String = {
+    val cs = Thread.currentThread().getStackTrace()(2)
+    s"${cs.getClassName}\\..*\\(${cs.getFileName}:\\d+\\)"
+  }
+
+  protected def getNextLineCallSitePattern(lines: Int = 1): String = {
+    val cs = Thread.currentThread().getStackTrace()(2)
+    Pattern.quote(
+      s"${cs.getClassName}.${cs.getMethodName}(${cs.getFileName}:${cs.getLineNumber + lines})")
+  }
 }
 
-object QueryTest {
+object QueryTest extends Assertions {
+  /**
+   * Runs the plan and makes sure the answer matches the expected result.
+   *
+   * @param df the DataFrame to be executed
+   * @param expectedAnswer the expected result in a Seq of Rows.
+   * @param checkToRDD whether to verify deserialization to an RDD. This runs the query twice.
+   */
+  def checkAnswer(df: DataFrame, expectedAnswer: Seq[Row], checkToRDD: Boolean = true): Unit = {
+    getErrorMessageInCheckAnswer(df, expectedAnswer, checkToRDD) match {
+      case Some(errorMessage) => fail(errorMessage)
+      case None =>
+    }
+  }
+
   /**
    * Runs the plan and makes sure the answer matches the expected result.
    * If there was exception during the execution or the contents of the DataFrame does not
-   * match the expected result, an error message will be returned. Otherwise, a [[None]] will
+   * match the expected result, an error message will be returned. Otherwise, a None will
    * be returned.
    *
-   * @param df the [[DataFrame]] to be executed
-   * @param expectedAnswer the expected result in a [[Seq]] of [[Row]]s.
+   * @param df the DataFrame to be executed
+   * @param expectedAnswer the expected result in a Seq of Rows.
    * @param checkToRDD whether to verify deserialization to an RDD. This runs the query twice.
    */
-  def checkAnswer(
+  def getErrorMessageInCheckAnswer(
       df: DataFrame,
       expectedAnswer: Seq[Row],
       checkToRDD: Boolean = true): Option[String] = {
     val isSorted = df.logicalPlan.collect { case s: logical.Sort => s }.nonEmpty
     if (checkToRDD) {
-      df.rdd.count()  // Also attempt to deserialize as an RDD [SPARK-15791]
+      SQLExecution.withSQLConfPropagated(df.sparkSession) {
+        df.rdd.count() // Also attempt to deserialize as an RDD [SPARK-15791]
+      }
     }
 
     val sparkAnswer = try df.collect().toSeq catch {
@@ -310,9 +347,8 @@ object QueryTest {
       // Convert array to Seq for easy equality check.
       case b: Array[_] => b.toSeq
       case r: Row => prepareRow(r)
-      // spark treats -0.0 as 0.0
-      case d: Double if d == -0.0d => 0.0d
-      case f: Float if f == -0.0f => 0.0f
+      // SPARK-51349: "null" and null had the same precedence in sorting
+      case "null" => "__null_string__"
       case o => o
     })
   }
@@ -352,11 +388,35 @@ object QueryTest {
     None
   }
 
+  def compare(obj1: Any, obj2: Any): Boolean = (obj1, obj2) match {
+    case (null, null) => true
+    case (null, _) => false
+    case (_, null) => false
+    case (a: Array[_], b: Array[_]) =>
+      a.length == b.length && a.zip(b).forall { case (l, r) => compare(l, r)}
+    case (a: Map[_, _], b: Map[_, _]) =>
+      a.size == b.size && a.keys.forall { aKey =>
+        b.keys.find(bKey => compare(aKey, bKey)).exists(bKey => compare(a(aKey), b(bKey)))
+      }
+    case (a: Iterable[_], b: Iterable[_]) =>
+      a.size == b.size && a.zip(b).forall { case (l, r) => compare(l, r)}
+    case (a: Product, b: Product) =>
+      compare(a.productIterator.toSeq, b.productIterator.toSeq)
+    case (a: Row, b: Row) =>
+      compare(a.toSeq, b.toSeq)
+    // 0.0 == -0.0, turn float/double to bits before comparison, to distinguish 0.0 and -0.0.
+    case (a: Double, b: Double) =>
+      java.lang.Double.doubleToRawLongBits(a) == java.lang.Double.doubleToRawLongBits(b)
+    case (a: Float, b: Float) =>
+      java.lang.Float.floatToRawIntBits(a) == java.lang.Float.floatToRawIntBits(b)
+    case (a, b) => a == b
+  }
+
   def sameRows(
       expectedAnswer: Seq[Row],
       sparkAnswer: Seq[Row],
       isSorted: Boolean = false): Option[String] = {
-    if (prepareAnswer(expectedAnswer, isSorted) != prepareAnswer(sparkAnswer, isSorted)) {
+    if (!compare(prepareAnswer(expectedAnswer, isSorted), prepareAnswer(sparkAnswer, isSorted))) {
       return Some(genError(expectedAnswer, sparkAnswer, isSorted))
     }
     None
@@ -385,18 +445,46 @@ object QueryTest {
     }
   }
 
-  def checkAnswer(df: DataFrame, expectedAnswer: java.util.List[Row]): String = {
-    checkAnswer(df, expectedAnswer.asScala) match {
-      case Some(errorMessage) => errorMessage
-      case None => null
+  def checkAnswer(df: DataFrame, expectedAnswer: java.util.List[Row]): Unit = {
+    getErrorMessageInCheckAnswer(df, expectedAnswer.asScala.toSeq) match {
+      case Some(errorMessage) => fail(errorMessage)
+      case None =>
     }
+  }
+
+  def withQueryExecutionsCaptured(spark: SparkSession)(thunk: => Unit): Seq[QueryExecution] = {
+    var capturedQueryExecutions = Seq.empty[QueryExecution]
+
+    val listener = new QueryExecutionListener {
+      override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = {
+        capturedQueryExecutions = capturedQueryExecutions :+ qe
+      }
+      override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {}
+    }
+
+    spark.sparkContext.listenerBus.waitUntilEmpty(15000)
+    spark.listenerManager.register(listener)
+    try {
+      thunk
+      spark.sparkContext.listenerBus.waitUntilEmpty(15000)
+    } finally {
+      spark.listenerManager.unregister(listener)
+    }
+
+    capturedQueryExecutions
   }
 }
 
-class QueryTestSuite extends QueryTest with test.SharedSQLContext {
+class QueryTestSuite extends QueryTest with test.SharedSparkSession {
   test("SPARK-16940: checkAnswer should raise TestFailedException for wrong results") {
     intercept[org.scalatest.exceptions.TestFailedException] {
       checkAnswer(sql("SELECT 1"), Row(2) :: Nil)
     }
+  }
+
+  test("SPARK-51349: null string and true null are distinguished") {
+    checkAnswer(sql("select case when id == 0 then struct('null') else struct(null) end s " +
+      "from range(2)"),
+      Seq(Row(Row(null)), Row(Row("null"))))
   }
 }

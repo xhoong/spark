@@ -17,157 +17,90 @@
 
 package org.apache.spark.sql.execution.python
 
-import java.io.File
-
-import scala.collection.JavaConverters._
-import scala.collection.mutable.ArrayBuffer
-
-import org.apache.spark.{SparkEnv, TaskContext}
-import org.apache.spark.api.python.{ChainedPythonFunctions, PythonEvalType}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.physical._
-import org.apache.spark.sql.execution.{GroupedIterator, SparkPlan, UnaryExecNode}
-import org.apache.spark.sql.execution.arrow.ArrowUtils
-import org.apache.spark.sql.types.{DataType, StructField, StructType}
-import org.apache.spark.util.Utils
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
+import org.apache.spark.sql.execution.window._
 
+/**
+ * This class calculates and outputs windowed aggregates over the rows in a single partition.
+ *
+ * This is similar to [[WindowExec]]. The main difference is that this node does not compute
+ * any window aggregation values. Instead, it computes the lower and upper bound for each window
+ * (i.e. window bounds) and pass the data and indices to Python worker to do the actual window
+ * aggregation.
+ *
+ * It currently materializes all data associated with the same partition key and passes them to
+ * Python worker. This is not strictly necessary for sliding windows and can be improved (by
+ * possibly slicing data into overlapping chunks and stitching them together).
+ *
+ * This class groups window expressions by their window boundaries so that window expressions
+ * with the same window boundaries can share the same window bounds. The window bounds are
+ * prepended to the data passed to the python worker.
+ *
+ * For example, if we have:
+ *     avg(v) over specifiedwindowframe(RowFrame, -5, 5),
+ *     avg(v) over specifiedwindowframe(RowFrame, UnboundedPreceding, UnboundedFollowing),
+ *     avg(v) over specifiedwindowframe(RowFrame, -3, 3),
+ *     max(v) over specifiedwindowframe(RowFrame, -3, 3)
+ *
+ * The python input will look like:
+ * (lower_bound_w1, upper_bound_w1, lower_bound_w3, upper_bound_w3, v)
+ *
+ * where w1 is specifiedwindowframe(RowFrame, -5, 5)
+ *       w2 is specifiedwindowframe(RowFrame, UnboundedPreceding, UnboundedFollowing)
+ *       w3 is specifiedwindowframe(RowFrame, -3, 3)
+ *
+ * Note that w2 doesn't have bound indices in the python input because it's unbounded window
+ * so it's bound indices will always be the same.
+ *
+ * Bounded window and Unbounded window are evaluated differently in Python worker:
+ * (1) Bounded window takes the window bound indices in addition to the input columns.
+ *     Unbounded window takes only input columns.
+ * (2) Bounded window evaluates the udf once per input row.
+ *     Unbounded window evaluates the udf once per window partition.
+ * This is controlled by Python runner conf "pandas_window_bound_types"
+ *
+ * The logic to compute window bounds is delegated to [[WindowFunctionFrame]] and shared with
+ * [[WindowExec]]
+ *
+ * Note this doesn't support partial aggregation and all aggregation is computed from the entire
+ * window.
+ */
 case class WindowInPandasExec(
     windowExpression: Seq[NamedExpression],
     partitionSpec: Seq[Expression],
     orderSpec: Seq[SortOrder],
-    child: SparkPlan) extends UnaryExecNode {
-
-  override def output: Seq[Attribute] =
-    child.output ++ windowExpression.map(_.toAttribute)
-
-  override def requiredChildDistribution: Seq[Distribution] = {
-    if (partitionSpec.isEmpty) {
-      // Only show warning when the number of bytes is larger than 100 MB?
-      logWarning("No Partition Defined for Window operation! Moving all data to a single "
-        + "partition, this can cause serious performance degradation.")
-      AllTuples :: Nil
-    } else {
-      ClusteredDistribution(partitionSpec) :: Nil
-    }
-  }
-
-  override def requiredChildOrdering: Seq[Seq[SortOrder]] =
-    Seq(partitionSpec.map(SortOrder(_, Ascending)) ++ orderSpec)
-
-  override def outputOrdering: Seq[SortOrder] = child.outputOrdering
-
-  override def outputPartitioning: Partitioning = child.outputPartitioning
-
-  private def collectFunctions(udf: PythonUDF): (ChainedPythonFunctions, Seq[Expression]) = {
-    udf.children match {
-      case Seq(u: PythonUDF) =>
-        val (chained, children) = collectFunctions(u)
-        (ChainedPythonFunctions(chained.funcs ++ Seq(udf.func)), children)
-      case children =>
-        // There should not be any other UDFs, or the children can't be evaluated directly.
-        assert(children.forall(_.find(_.isInstanceOf[PythonUDF]).isEmpty))
-        (ChainedPythonFunctions(Seq(udf.func)), udf.children)
-    }
-  }
-
-  /**
-   * Create the resulting projection.
-   *
-   * This method uses Code Generation. It can only be used on the executor side.
-   *
-   * @param expressions unbound ordered function expressions.
-   * @return the final resulting projection.
-   */
-  private[this] def createResultProjection(expressions: Seq[Expression]): UnsafeProjection = {
-    val references = expressions.zipWithIndex.map { case (e, i) =>
-      // Results of window expressions will be on the right side of child's output
-      BoundReference(child.output.size + i, e.dataType, e.nullable)
-    }
-    val unboundToRefMap = expressions.zip(references).toMap
-    val patchedWindowExpression = windowExpression.map(_.transform(unboundToRefMap))
-    UnsafeProjection.create(
-      child.output ++ patchedWindowExpression,
-      child.output)
-  }
+    child: SparkPlan)
+  extends WindowExecBase with PythonSQLMetrics {
+  override lazy val metrics: Map[String, SQLMetric] = pythonMetrics ++ Map(
+    "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size")
+  )
 
   protected override def doExecute(): RDD[InternalRow] = {
-    val inputRDD = child.execute()
+    val evaluatorFactory =
+      new WindowInPandasEvaluatorFactory(
+        windowExpression,
+        partitionSpec,
+        orderSpec,
+        child.output,
+        longMetric("spillSize"),
+        pythonMetrics,
+        conf.pythonUDFProfiler)
 
-    val sessionLocalTimeZone = conf.sessionLocalTimeZone
-    val pythonRunnerConf = ArrowUtils.getPythonRunnerConfMap(conf)
-
-    // Extract window expressions and window functions
-    val expressions = windowExpression.flatMap(_.collect { case e: WindowExpression => e })
-
-    val udfExpressions = expressions.map(_.windowFunction.asInstanceOf[PythonUDF])
-
-    val (pyFuncs, inputs) = udfExpressions.map(collectFunctions).unzip
-
-    // Filter child output attributes down to only those that are UDF inputs.
-    // Also eliminate duplicate UDF inputs.
-    val allInputs = new ArrayBuffer[Expression]
-    val dataTypes = new ArrayBuffer[DataType]
-    val argOffsets = inputs.map { input =>
-      input.map { e =>
-        if (allInputs.exists(_.semanticEquals(e))) {
-          allInputs.indexWhere(_.semanticEquals(e))
-        } else {
-          allInputs += e
-          dataTypes += e.dataType
-          allInputs.length - 1
-        }
-      }.toArray
-    }.toArray
-
-    // Schema of input rows to the python runner
-    val windowInputSchema = StructType(dataTypes.zipWithIndex.map { case (dt, i) =>
-      StructField(s"_$i", dt)
-    })
-
-    inputRDD.mapPartitionsInternal { iter =>
-      val context = TaskContext.get()
-
-      val grouped = if (partitionSpec.isEmpty) {
-        // Use an empty unsafe row as a place holder for the grouping key
-        Iterator((new UnsafeRow(), iter))
-      } else {
-        GroupedIterator(iter, partitionSpec, child.output)
-      }
-
-      // The queue used to buffer input rows so we can drain it to
-      // combine input with output from Python.
-      val queue = HybridRowQueue(context.taskMemoryManager(),
-        new File(Utils.getLocalDir(SparkEnv.get.conf)), child.output.length)
-      context.addTaskCompletionListener[Unit] { _ =>
-        queue.close()
-      }
-
-      val inputProj = UnsafeProjection.create(allInputs, child.output)
-      val pythonInput = grouped.map { case (_, rows) =>
-        rows.map { row =>
-          queue.add(row.asInstanceOf[UnsafeRow])
-          inputProj(row)
-        }
-      }
-
-      val windowFunctionResult = new ArrowPythonRunner(
-        pyFuncs,
-        PythonEvalType.SQL_WINDOW_AGG_PANDAS_UDF,
-        argOffsets,
-        windowInputSchema,
-        sessionLocalTimeZone,
-        pythonRunnerConf).compute(pythonInput, context.partitionId(), context)
-
-      val joined = new JoinedRow
-      val resultProj = createResultProjection(expressions)
-
-      windowFunctionResult.flatMap(_.rowIterator.asScala).map { windowOutput =>
-        val leftRow = queue.remove()
-        val joinedRow = joined(leftRow, windowOutput)
-        resultProj(joinedRow)
+    // Start processing.
+    if (conf.usePartitionEvaluator) {
+      child.execute().mapPartitionsWithEvaluator(evaluatorFactory)
+    } else {
+      child.execute().mapPartitionsWithIndex { (index, rowIterator) =>
+        val evaluator = evaluatorFactory.createEvaluator()
+        evaluator.eval(index, rowIterator)
       }
     }
   }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): WindowInPandasExec =
+    copy(child = newChild)
 }

@@ -16,29 +16,30 @@
  */
 package org.apache.spark.deploy.k8s.features
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
-import io.fabric8.kubernetes.api.model.{ContainerBuilder, EnvVarBuilder}
+import io.fabric8.kubernetes.api.model.ContainerBuilder
 
 import org.apache.spark.deploy.k8s._
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.deploy.k8s.submit._
-import org.apache.spark.internal.config._
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.{CONFIG, CONFIG2, CONFIG3, CONFIG4, CONFIG5}
+import org.apache.spark.internal.config.{PYSPARK_DRIVER_PYTHON, PYSPARK_PYTHON}
 import org.apache.spark.launcher.SparkLauncher
-import org.apache.spark.util.Utils
 
 /**
  * Creates the driver command for running the user app, and propagates needed configuration so
  * executors can also find the app code.
  */
 private[spark] class DriverCommandFeatureStep(conf: KubernetesDriverConf)
-  extends KubernetesFeatureConfigStep {
+  extends KubernetesFeatureConfigStep with Logging {
 
   override def configurePod(pod: SparkPod): SparkPod = {
     conf.mainAppResource match {
-      case JavaMainAppResource(_) =>
-        configureForJava(pod)
+      case JavaMainAppResource(res) =>
+        configureForJava(pod, res.getOrElse(SparkLauncher.NO_RESOURCE))
 
       case PythonMainAppResource(res) =>
         configureForPython(pod, res)
@@ -49,45 +50,59 @@ private[spark] class DriverCommandFeatureStep(conf: KubernetesDriverConf)
   }
 
   override def getAdditionalPodSystemProperties(): Map[String, String] = {
-    conf.mainAppResource match {
-      case JavaMainAppResource(res) =>
-        res.map(additionalJavaProperties).getOrElse(Map.empty)
+    val appType = conf.mainAppResource match {
+      case JavaMainAppResource(_) =>
+        APP_RESOURCE_TYPE_JAVA
 
-      case PythonMainAppResource(res) =>
-        additionalPythonProperties(res)
+      case PythonMainAppResource(_) =>
+        APP_RESOURCE_TYPE_PYTHON
 
-      case RMainAppResource(res) =>
-        additionalRProperties(res)
+      case RMainAppResource(_) =>
+        APP_RESOURCE_TYPE_R
     }
+
+    Map(APP_RESOURCE_TYPE.key -> appType)
   }
 
-  private def configureForJava(pod: SparkPod): SparkPod = {
-    // The user application jar is merged into the spark.jars list and managed through that
-    // property, so use a "blank" resource for the Java driver.
-    val driverContainer = baseDriverContainer(pod, SparkLauncher.NO_RESOURCE).build()
+  private def configureForJava(pod: SparkPod, res: String): SparkPod = {
+    // re-write primary resource, app jar is also added to spark.jars by default in SparkSubmit
+    // no uploading takes place here
+    val newResName = KubernetesUtils
+      .renameMainAppResource(resource = res, shouldUploadLocal = false)
+    val driverContainer = baseDriverContainer(pod, newResName).build()
     SparkPod(pod.pod, driverContainer)
   }
 
-  private def configureForPython(pod: SparkPod, res: String): SparkPod = {
-    val maybePythonFiles = if (conf.pyFiles.nonEmpty) {
-      // Delineation by ":" is to append the PySpark Files to the PYTHONPATH
-      // of the respective PySpark pod
-      val resolved = KubernetesUtils.resolveFileUrisAndPath(conf.pyFiles)
-      Some(new EnvVarBuilder()
-        .withName(ENV_PYSPARK_FILES)
-        .withValue(resolved.mkString(":"))
-        .build())
-    } else {
-      None
-    }
-    val pythonEnvs =
-      Seq(new EnvVarBuilder()
-          .withName(ENV_PYSPARK_MAJOR_PYTHON_VERSION)
-          .withValue(conf.get(PYSPARK_MAJOR_PYTHON_VERSION))
-        .build()) ++
-      maybePythonFiles
+  // Exposed for testing purpose.
+  private[spark] def environmentVariables: Map[String, String] = sys.env
 
-    val pythonContainer = baseDriverContainer(pod, KubernetesUtils.resolveFileUri(res))
+  private def configureForPython(pod: SparkPod, res: String): SparkPod = {
+    if (conf.get(PYSPARK_MAJOR_PYTHON_VERSION).isDefined) {
+      logWarning(
+          log"${MDC(CONFIG, PYSPARK_MAJOR_PYTHON_VERSION.key)} was deprecated in Spark 3.1. " +
+            log"Please set '${MDC(CONFIG2, PYSPARK_PYTHON.key)}' and " +
+            log"'${MDC(CONFIG3, PYSPARK_DRIVER_PYTHON.key)}' " +
+            log"configurations or ${MDC(CONFIG4, ENV_PYSPARK_PYTHON)} and " +
+            log"${MDC(CONFIG5, ENV_PYSPARK_DRIVER_PYTHON)} environment variables instead.")
+    }
+
+    val pythonEnvs = {
+      KubernetesUtils.buildEnvVars(
+        Seq(
+          ENV_PYSPARK_PYTHON -> conf.get(PYSPARK_PYTHON)
+            .orElse(environmentVariables.get(ENV_PYSPARK_PYTHON))
+            .orNull,
+          ENV_PYSPARK_DRIVER_PYTHON -> conf.get(PYSPARK_DRIVER_PYTHON)
+            .orElse(conf.get(PYSPARK_PYTHON))
+            .orElse(environmentVariables.get(ENV_PYSPARK_DRIVER_PYTHON))
+            .orElse(environmentVariables.get(ENV_PYSPARK_PYTHON))
+            .orNull))
+    }
+
+    // re-write primary resource to be the remote one and upload the related file
+    val newResName = KubernetesUtils
+      .renameMainAppResource(res, Option(conf.sparkConf), true)
+    val pythonContainer = baseDriverContainer(pod, newResName)
       .addAllToEnv(pythonEnvs.asJava)
       .build()
 
@@ -95,38 +110,22 @@ private[spark] class DriverCommandFeatureStep(conf: KubernetesDriverConf)
   }
 
   private def configureForR(pod: SparkPod, res: String): SparkPod = {
-    val rContainer = baseDriverContainer(pod, KubernetesUtils.resolveFileUri(res)).build()
+    val rContainer = baseDriverContainer(pod, res).build()
     SparkPod(pod.pod, rContainer)
   }
 
   private def baseDriverContainer(pod: SparkPod, resource: String): ContainerBuilder = {
+    var proxyUserArgs = Seq[String]()
+    if (!conf.proxyUser.isEmpty) {
+      proxyUserArgs = proxyUserArgs :+ "--proxy-user"
+      proxyUserArgs = proxyUserArgs :+ conf.proxyUser.get
+    }
     new ContainerBuilder(pod.container)
       .addToArgs("driver")
+      .addToArgs(proxyUserArgs: _*)
       .addToArgs("--properties-file", SPARK_CONF_PATH)
       .addToArgs("--class", conf.mainClass)
       .addToArgs(resource)
       .addToArgs(conf.appArgs: _*)
-  }
-
-  private def additionalJavaProperties(resource: String): Map[String, String] = {
-    resourceType(APP_RESOURCE_TYPE_JAVA) ++ mergeFileList("spark.jars", Seq(resource))
-  }
-
-  private def additionalPythonProperties(resource: String): Map[String, String] = {
-    resourceType(APP_RESOURCE_TYPE_PYTHON) ++
-      mergeFileList("spark.files", Seq(resource) ++ conf.pyFiles)
-  }
-
-  private def additionalRProperties(resource: String): Map[String, String] = {
-    resourceType(APP_RESOURCE_TYPE_R) ++ mergeFileList("spark.files", Seq(resource))
-  }
-
-  private def mergeFileList(key: String, filesToAdd: Seq[String]): Map[String, String] = {
-    val existing = Utils.stringToSeq(conf.get(key, ""))
-    Map(key -> (existing ++ filesToAdd).distinct.mkString(","))
-  }
-
-  private def resourceType(resType: String): Map[String, String] = {
-    Map(APP_RESOURCE_TYPE.key -> resType)
   }
 }

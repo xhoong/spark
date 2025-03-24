@@ -17,26 +17,25 @@
 
 package org.apache.spark.sql.execution.datasources.text
 
-import java.io.OutputStream
-
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapreduce.{Job, TaskAttemptContext}
 
 import org.apache.spark.TaskContext
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.catalyst.expressions.codegen.UnsafeRowWriter
 import org.apache.spark.sql.catalyst.util.CompressionCodecs
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types.{DataType, StringType, StructType}
-import org.apache.spark.util.SerializableConfiguration
+import org.apache.spark.util.{SerializableConfiguration, Utils}
 
 /**
- * A data source for reading text files.
+ * A data source for reading text files. The text files must be encoded as UTF-8.
  */
 class TextFileFormat extends TextBasedFileFormat with DataSourceRegister {
 
@@ -46,8 +45,13 @@ class TextFileFormat extends TextBasedFileFormat with DataSourceRegister {
 
   private def verifySchema(schema: StructType): Unit = {
     if (schema.size != 1) {
-      throw new AnalysisException(
-        s"Text data source supports only a single column, and you have ${schema.size} columns.")
+      throw QueryCompilationErrors.textDataSourceWithMultiColumnsError(schema)
+    }
+  }
+
+  private def verifyReadSchema(schema: StructType): Unit = {
+    if (schema.size > 1) {
+      throw QueryCompilationErrors.textDataSourceWithMultiColumnsError(schema)
     }
   }
 
@@ -100,9 +104,7 @@ class TextFileFormat extends TextBasedFileFormat with DataSourceRegister {
       filters: Seq[Filter],
       options: Map[String, String],
       hadoopConf: Configuration): PartitionedFile => Iterator[InternalRow] = {
-    assert(
-      requiredSchema.length <= 1,
-      "Text data source only produces a single data column named \"value\".")
+    verifyReadSchema(requiredSchema)
     val textOptions = new TextOptions(options)
     val broadcastedHadoopConf =
       sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
@@ -117,10 +119,12 @@ class TextFileFormat extends TextBasedFileFormat with DataSourceRegister {
 
     (file: PartitionedFile) => {
       val confValue = conf.value.value
-      val reader = if (!textOptions.wholeText) {
-        new HadoopFileLinesReader(file, textOptions.lineSeparatorInRead, confValue)
-      } else {
-        new HadoopFileWholeTextReader(file, confValue)
+      val reader = Utils.createResourceUninterruptiblyIfInTaskThread {
+        if (!textOptions.wholeText) {
+          new HadoopFileLinesReader(file, textOptions.lineSeparatorInRead, confValue)
+        } else {
+          new HadoopFileWholeTextReader(file, confValue)
+        }
       }
       Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => reader.close()))
       if (requiredSchema.isEmpty) {
@@ -139,34 +143,7 @@ class TextFileFormat extends TextBasedFileFormat with DataSourceRegister {
     }
   }
 
-  override def supportDataType(dataType: DataType, isReadPath: Boolean): Boolean =
-    dataType == StringType
+  override def supportDataType(dataType: DataType): Boolean =
+    dataType.isInstanceOf[StringType]
 }
 
-class TextOutputWriter(
-    path: String,
-    dataSchema: StructType,
-    lineSeparator: Array[Byte],
-    context: TaskAttemptContext)
-  extends OutputWriter {
-
-  private var outputStream: Option[OutputStream] = None
-
-  override def write(row: InternalRow): Unit = {
-    val os = outputStream.getOrElse{
-      val newStream = CodecStreams.createOutputStream(context, new Path(path))
-      outputStream = Some(newStream)
-      newStream
-    }
-
-    if (!row.isNullAt(0)) {
-      val utf8string = row.getUTF8String(0)
-      utf8string.writeTo(os)
-    }
-    os.write(lineSeparator)
-  }
-
-  override def close(): Unit = {
-    outputStream.map(_.close())
-  }
-}

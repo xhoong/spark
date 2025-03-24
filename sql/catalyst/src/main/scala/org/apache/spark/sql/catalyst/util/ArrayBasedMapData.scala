@@ -19,6 +19,8 @@ package org.apache.spark.sql.catalyst.util
 
 import java.util.{Map => JavaMap}
 
+import org.apache.spark.util.collection.Utils
+
 /**
  * A simple `MapData` implementation which is backed by 2 arrays.
  *
@@ -48,11 +50,10 @@ object ArrayBasedMapData {
    * @param valueConverter This function is applied over all the values of the input map to
    *                       obtain the output map's values
    */
-  def apply(
-      javaMap: JavaMap[_, _],
+  def apply[K, V](
+      javaMap: JavaMap[K, V],
       keyConverter: (Any) => Any,
       valueConverter: (Any) => Any): ArrayBasedMapData = {
-    import scala.language.existentials
 
     val keys: Array[Any] = new Array[Any](javaMap.size())
     val values: Array[Any] = new Array[Any](javaMap.size())
@@ -130,19 +131,19 @@ object ArrayBasedMapData {
   def toScalaMap(map: ArrayBasedMapData): Map[Any, Any] = {
     val keys = map.keyArray.asInstanceOf[GenericArrayData].array
     val values = map.valueArray.asInstanceOf[GenericArrayData].array
-    keys.zip(values).toMap
+    Utils.toMap(keys, values)
   }
 
   def toScalaMap(keys: Array[Any], values: Array[Any]): Map[Any, Any] = {
-    keys.zip(values).toMap
+    Utils.toMap(keys, values)
   }
 
-  def toScalaMap(keys: Seq[Any], values: Seq[Any]): Map[Any, Any] = {
-    keys.zip(values).toMap
+  def toScalaMap(keys: scala.collection.Seq[Any],
+      values: scala.collection.Seq[Any]): Map[Any, Any] = {
+    Utils.toMap(keys, values)
   }
 
   def toJavaMap(keys: Array[Any], values: Array[Any]): java.util.Map[Any, Any] = {
-    import scala.collection.JavaConverters._
-    keys.zip(values).toMap.asJava
+    Utils.toJavaMap(keys, values)
   }
 }

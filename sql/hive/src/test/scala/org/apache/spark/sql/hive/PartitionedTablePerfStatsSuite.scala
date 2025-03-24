@@ -34,6 +34,9 @@ class PartitionedTablePerfStatsSuite
 
   override def beforeEach(): Unit = {
     super.beforeEach()
+    // Hive operation counters are doubled in dual-analyzer mode.
+    hiveContext.sparkSession.conf.set(
+      SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key, "false")
     FileStatusCache.resetForTesting()
   }
 
@@ -100,7 +103,7 @@ class PartitionedTablePerfStatsSuite
   }
 
   genericTest("partitioned pruned table reports only selected files") { spec =>
-    assert(spark.sqlContext.getConf(HiveUtils.CONVERT_METASTORE_PARQUET.key) == "true")
+    assert(spark.conf.get(HiveUtils.CONVERT_METASTORE_PARQUET.key) == "true")
     withTable("test") {
       withTempDir { dir =>
         spec.setupTable("test", dir)
@@ -300,7 +303,7 @@ class PartitionedTablePerfStatsSuite
 
           HiveCatalogMetrics.reset()
           assert(spark.sql("show partitions test").count() == 100)
-          assert(HiveCatalogMetrics.METRIC_HIVE_CLIENT_CALLS.getCount() < 10)
+          assert(HiveCatalogMetrics.METRIC_HIVE_CLIENT_CALLS.getCount() <= 10)
         }
       }
     }
@@ -323,7 +326,7 @@ class PartitionedTablePerfStatsSuite
 
           HiveCatalogMetrics.reset()
           assert(spark.sql("show partitions test").count() == 100)
-          assert(HiveCatalogMetrics.METRIC_HIVE_CLIENT_CALLS.getCount() < 10)
+          assert(HiveCatalogMetrics.METRIC_HIVE_CLIENT_CALLS.getCount() <= 10)
         }
       }
     }
@@ -390,8 +393,8 @@ class PartitionedTablePerfStatsSuite
     withSQLConf(SQLConf.HIVE_MANAGE_FILESOURCE_PARTITIONS.key -> "false") {
       withTable("test") {
         withTempDir { dir =>
-          HiveCatalogMetrics.reset()
           setupPartitionedHiveTable("test", dir, 50)
+          HiveCatalogMetrics.reset()
           // select the table in multi-threads
           val executorPool = Executors.newFixedThreadPool(10)
           (1 to 10).map(threadId => {

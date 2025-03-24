@@ -47,11 +47,11 @@ object RawTextHelper {
           i += 1
         }
       }
-      map.toIterator.map {
+      map.iterator.map {
         case (k, v) => (k, v)
       }
     }
-    map.toIterator.map{case (k, v) => (k, v)}
+    map.iterator.map{case (k, v) => (k, v)}
   }
 
   /**
@@ -67,7 +67,7 @@ object RawTextHelper {
     var swap: (String, Long) = null
     var count = 0
 
-    while(data.hasNext) {
+    while (data.hasNext) {
       value = data.next()
       if (value != null) {
         count += 1
@@ -80,7 +80,7 @@ object RawTextHelper {
           }
           taken(len - 1) = value
           i = len - 1
-          while(i > 0 && taken(i - 1)._2 < taken(i)._2) {
+          while (i > 0 && taken(i - 1)._2 < taken(i)._2) {
             swap = taken(i)
             taken(i) = taken(i-1)
             taken(i - 1) = swap
@@ -89,14 +89,14 @@ object RawTextHelper {
         }
       }
     }
-    taken.toIterator
+    taken.iterator
   }
 
   /**
-   * Warms up the SparkContext in master and slave by running tasks to force JIT kick in
+   * Warms up the SparkContext in master and executor by running tasks to force JIT kick in
    * before real workload starts.
    */
-  def warmUp(sc: SparkContext) {
+  def warmUp(sc: SparkContext): Unit = {
     for (i <- 0 to 1) {
       sc.parallelize(1 to 200000, 1000)
         .map(_ % 1331).map(_.toString)

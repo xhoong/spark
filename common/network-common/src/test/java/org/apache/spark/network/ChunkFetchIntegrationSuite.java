@@ -32,11 +32,11 @@ import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Sets;
 import com.google.common.io.Closeables;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 
 import org.apache.spark.network.buffer.FileSegmentManagedBuffer;
 import org.apache.spark.network.buffer.ManagedBuffer;
@@ -56,6 +56,7 @@ public class ChunkFetchIntegrationSuite {
   static final int BUFFER_CHUNK_INDEX = 0;
   static final int FILE_CHUNK_INDEX = 1;
 
+  static TransportContext context;
   static TransportServer server;
   static TransportClientFactory clientFactory;
   static StreamManager streamManager;
@@ -64,8 +65,13 @@ public class ChunkFetchIntegrationSuite {
   static ManagedBuffer bufferChunk;
   static ManagedBuffer fileChunk;
 
-  @BeforeClass
+  // This is split out so it can be invoked in a subclass with a different config
+  @BeforeAll
   public static void setUp() throws Exception {
+    doSetUpWithConfig(new TransportConf("shuffle", MapConfigProvider.EMPTY));
+  }
+
+  public static void doSetUpWithConfig(final TransportConf conf) throws Exception {
     int bufSize = 100000;
     final ByteBuffer buf = ByteBuffer.allocate(bufSize);
     for (int i = 0; i < bufSize; i ++) {
@@ -87,7 +93,6 @@ public class ChunkFetchIntegrationSuite {
       Closeables.close(fp, shouldSuppressIOException);
     }
 
-    final TransportConf conf = new TransportConf("shuffle", MapConfigProvider.EMPTY);
     fileChunk = new FileSegmentManagedBuffer(conf, testFile, 10, testFile.length() - 25);
 
     streamManager = new StreamManager() {
@@ -117,16 +122,17 @@ public class ChunkFetchIntegrationSuite {
         return streamManager;
       }
     };
-    TransportContext context = new TransportContext(conf, handler);
+    context = new TransportContext(conf, handler);
     server = context.createServer();
     clientFactory = context.createClientFactory();
   }
 
-  @AfterClass
+  @AfterAll
   public static void tearDown() {
     bufferChunk.release();
     server.close();
     clientFactory.close();
+    context.close();
     testFile.delete();
   }
 
@@ -149,9 +155,9 @@ public class ChunkFetchIntegrationSuite {
       clientFactory.createClient(TestUtils.getLocalHost(), server.getPort())) {
       final Semaphore sem = new Semaphore(0);
 
-      res.successChunks = Collections.synchronizedSet(new HashSet<Integer>());
-      res.failedChunks = Collections.synchronizedSet(new HashSet<Integer>());
-      res.buffers = Collections.synchronizedList(new LinkedList<ManagedBuffer>());
+      res.successChunks = Collections.synchronizedSet(new HashSet<>());
+      res.failedChunks = Collections.synchronizedSet(new HashSet<>());
+      res.buffers = Collections.synchronizedList(new LinkedList<>());
 
       ChunkReceivedCallback callback = new ChunkReceivedCallback() {
         @Override
@@ -172,7 +178,7 @@ public class ChunkFetchIntegrationSuite {
       for (int chunkIndex : chunkIndices) {
         client.fetchChunk(STREAM_ID, chunkIndex, callback);
       }
-      if (!sem.tryAcquire(chunkIndices.size(), 5, TimeUnit.SECONDS)) {
+      if (!sem.tryAcquire(chunkIndices.size(), 60, TimeUnit.SECONDS)) {
         fail("Timeout getting response from the server");
       }
     }

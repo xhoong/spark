@@ -71,15 +71,15 @@ class SQLConfEntrySuite extends SparkFunSuite {
     assert(conf.getConf(confEntry, false) === false)
 
     conf.setConf(confEntry, true)
-    assert(conf.getConf(confEntry, false) === true)
+    assert(conf.getConf(confEntry, false))
 
     conf.setConfString(key, "true")
     assert(conf.getConfString(key, "false") === "true")
     assert(conf.getConfString(key) === "true")
-    assert(conf.getConf(confEntry, false) === true)
+    assert(conf.getConf(confEntry, false))
 
     conf.setConfString(key, " true ")
-    assert(conf.getConf(confEntry, false) === true)
+    assert(conf.getConf(confEntry, false))
     val e = intercept[IllegalArgumentException] {
       conf.setConfString(key, "abc")
     }
@@ -107,7 +107,7 @@ class SQLConfEntrySuite extends SparkFunSuite {
 
   test("stringConf") {
     val key = "spark.sql.SQLConfEntrySuite.string"
-    val confEntry = buildConf(key).stringConf.createWithDefault(null)
+    val confEntry = buildConf(key).stringConf.createWithDefault("")
     assert(conf.getConf(confEntry, "abc") === "abc")
 
     conf.setConf(confEntry, "abcd")
@@ -185,12 +185,14 @@ class SQLConfEntrySuite extends SparkFunSuite {
     val e1 = intercept[IllegalArgumentException] {
       conf.getConf(confEntry)
     }
-    assert(e1.getMessage === "The maximum size of the cache must not be negative")
+    assert(e1.getMessage === s"'-1' in ${confEntry.key} is invalid." +
+      s" The maximum size of the cache must not be negative")
 
     val e2 = intercept[IllegalArgumentException] {
       conf.setConfString(confEntry.key, "-1")
     }
-    assert(e2.getMessage === "The maximum size of the cache must not be negative")
+    assert(e2.getMessage === s"'-1' in ${confEntry.key} is invalid." +
+      s" The maximum size of the cache must not be negative")
   }
 
   test("clone SQLConf") {

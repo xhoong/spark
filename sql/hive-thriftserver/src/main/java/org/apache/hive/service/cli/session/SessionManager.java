@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -30,17 +29,20 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.io.FileUtils;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
 import org.apache.hive.service.CompositeService;
 import org.apache.hive.service.cli.HiveSQLException;
 import org.apache.hive.service.cli.SessionHandle;
 import org.apache.hive.service.cli.operation.OperationManager;
-import org.apache.hive.service.cli.thrift.TProtocolVersion;
+import org.apache.hive.service.rpc.thrift.TProtocolVersion;
 import org.apache.hive.service.server.HiveServer2;
 import org.apache.hive.service.server.ThreadFactoryWithGarbageCleanup;
+
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
 
 /**
  * SessionManager.
@@ -48,7 +50,7 @@ import org.apache.hive.service.server.ThreadFactoryWithGarbageCleanup;
  */
 public class SessionManager extends CompositeService {
 
-  private static final Log LOG = LogFactory.getLog(SessionManager.class);
+  private static final SparkLogger LOG = SparkLoggerFactory.getLogger(SessionManager.class);
   public static final String HIVERCFILE = ".hiverc";
   private HiveConf hiveConf;
   private final Map<SessionHandle, HiveSession> handleToSession =
@@ -85,13 +87,15 @@ public class SessionManager extends CompositeService {
 
   private void createBackgroundOperationPool() {
     int poolSize = hiveConf.getIntVar(ConfVars.HIVE_SERVER2_ASYNC_EXEC_THREADS);
-    LOG.info("HiveServer2: Background operation thread pool size: " + poolSize);
+    LOG.info("HiveServer2: Background operation thread pool size: {}",
+      MDC.of(LogKeys.THREAD_POOL_SIZE$.MODULE$, poolSize));
     int poolQueueSize = hiveConf.getIntVar(ConfVars.HIVE_SERVER2_ASYNC_EXEC_WAIT_QUEUE_SIZE);
-    LOG.info("HiveServer2: Background operation thread wait queue size: " + poolQueueSize);
+    LOG.info("HiveServer2: Background operation thread wait queue size: {}",
+      MDC.of(LogKeys.THREAD_POOL_WAIT_QUEUE_SIZE$.MODULE$, poolQueueSize));
     long keepAliveTime = HiveConf.getTimeVar(
         hiveConf, ConfVars.HIVE_SERVER2_ASYNC_EXEC_KEEPALIVE_TIME, TimeUnit.SECONDS);
-    LOG.info(
-        "HiveServer2: Background operation thread keepalive time: " + keepAliveTime + " seconds");
+    LOG.info("HiveServer2: Background operation thread keepalive time: {} ms",
+      MDC.of(LogKeys.THREAD_POOL_KEEPALIVE_TIME$.MODULE$, keepAliveTime * 1000L));
 
     // Create a thread pool with #poolSize threads
     // Threads terminate when they are idle for more than the keepAliveTime
@@ -116,26 +120,27 @@ public class SessionManager extends CompositeService {
     isOperationLogEnabled = true;
 
     if (operationLogRootDir.exists() && !operationLogRootDir.isDirectory()) {
-      LOG.warn("The operation log root directory exists, but it is not a directory: " +
-          operationLogRootDir.getAbsolutePath());
+      LOG.warn("The operation log root directory exists, but it is not a directory: {}",
+        MDC.of(LogKeys.PATH$.MODULE$, operationLogRootDir.getAbsolutePath()));
       isOperationLogEnabled = false;
     }
 
     if (!operationLogRootDir.exists()) {
       if (!operationLogRootDir.mkdirs()) {
-        LOG.warn("Unable to create operation log root directory: " +
-            operationLogRootDir.getAbsolutePath());
+        LOG.warn("Unable to create operation log root directory: {}",
+          MDC.of(LogKeys.PATH$.MODULE$, operationLogRootDir.getAbsolutePath()));
         isOperationLogEnabled = false;
       }
     }
 
     if (isOperationLogEnabled) {
-      LOG.info("Operation log root directory is created: " + operationLogRootDir.getAbsolutePath());
+      LOG.info("Operation log root directory is created: {}",
+        MDC.of(LogKeys.PATH$.MODULE$, operationLogRootDir.getAbsolutePath()));
       try {
         FileUtils.forceDeleteOnExit(operationLogRootDir);
       } catch (IOException e) {
-        LOG.warn("Failed to schedule cleanup HS2 operation logging root dir: " +
-            operationLogRootDir.getAbsolutePath(), e);
+        LOG.warn("Failed to schedule cleanup HS2 operation logging root dir: {}", e,
+          MDC.of(LogKeys.PATH$.MODULE$, operationLogRootDir.getAbsolutePath()));
       }
     }
   }
@@ -148,46 +153,64 @@ public class SessionManager extends CompositeService {
     }
   }
 
+  private final Object timeoutCheckerLock = new Object();
+
   private void startTimeoutChecker() {
     final long interval = Math.max(checkInterval, 3000L);  // minimum 3 seconds
-    Runnable timeoutChecker = new Runnable() {
+    final Runnable timeoutChecker = new Runnable() {
       @Override
       public void run() {
-        for (sleepInterval(interval); !shutdown; sleepInterval(interval)) {
+        sleepFor(interval);
+        while (!shutdown) {
           long current = System.currentTimeMillis();
           for (HiveSession session : new ArrayList<HiveSession>(handleToSession.values())) {
+            if (shutdown) {
+              break;
+            }
             if (sessionTimeout > 0 && session.getLastAccessTime() + sessionTimeout <= current
                 && (!checkOperation || session.getNoOperationTime() > sessionTimeout)) {
               SessionHandle handle = session.getSessionHandle();
-              LOG.warn("Session " + handle + " is Timed-out (last access : " +
-                  new Date(session.getLastAccessTime()) + ") and will be closed");
+              LOG.warn("Session {} is Timed-out (last access : {}) and will be closed",
+                MDC.of(LogKeys.SESSION_HANDLE$.MODULE$, handle),
+                MDC.of(LogKeys.LAST_ACCESS_TIME$.MODULE$, new Date(session.getLastAccessTime())));
               try {
                 closeSession(handle);
               } catch (HiveSQLException e) {
-                LOG.warn("Exception is thrown closing session " + handle, e);
+                LOG.warn("Exception is thrown closing session {}", e,
+                  MDC.of(LogKeys.SESSION_HANDLE$.MODULE$, handle));
               }
             } else {
               session.closeExpiredOperations();
             }
           }
+          sleepFor(interval);
         }
       }
 
-      private void sleepInterval(long interval) {
-        try {
-          Thread.sleep(interval);
-        } catch (InterruptedException e) {
-          // ignore
+      private void sleepFor(long interval) {
+        synchronized (timeoutCheckerLock) {
+          try {
+            timeoutCheckerLock.wait(interval);
+          } catch (InterruptedException e) {
+            // Ignore, and break.
+          }
         }
       }
     };
     backgroundOperationPool.execute(timeoutChecker);
   }
 
+  private void shutdownTimeoutChecker() {
+    shutdown = true;
+    synchronized (timeoutCheckerLock) {
+      timeoutCheckerLock.notify();
+    }
+  }
+
   @Override
   public synchronized void stop() {
     super.stop();
-    shutdown = true;
+    shutdownTimeoutChecker();
     if (backgroundOperationPool != null) {
       backgroundOperationPool.shutdown();
       long timeout = hiveConf.getTimeVar(
@@ -195,8 +218,9 @@ public class SessionManager extends CompositeService {
       try {
         backgroundOperationPool.awaitTermination(timeout, TimeUnit.SECONDS);
       } catch (InterruptedException e) {
-        LOG.warn("HIVE_SERVER2_ASYNC_EXEC_SHUTDOWN_TIMEOUT = " + timeout +
-            " seconds has been exceeded. RUNNING background operations will be shut down", e);
+        LOG.warn("HIVE_SERVER2_ASYNC_EXEC_SHUTDOWN_TIMEOUT = {} ms has been exceeded. " +
+          "RUNNING background operations will be shut down", e,
+          MDC.of(LogKeys.TIMEOUT$.MODULE$, timeout * 1000));
       }
       backgroundOperationPool = null;
     }
@@ -208,8 +232,8 @@ public class SessionManager extends CompositeService {
       try {
         FileUtils.forceDelete(operationLogRootDir);
       } catch (Exception e) {
-        LOG.warn("Failed to cleanup root dir of HS2 logging: " + operationLogRootDir
-            .getAbsolutePath(), e);
+        LOG.warn("Failed to cleanup root dir of HS2 logging: {}", e,
+          MDC.of(LogKeys.PATH$.MODULE$, operationLogRootDir.getAbsolutePath()));
       }
     }
   }

@@ -17,10 +17,11 @@
 
 package org.apache.spark.ui.exec
 
-import javax.servlet.http.HttpServletRequest
+import scala.xml.{Node, Unparsed}
 
-import scala.xml.Node
+import jakarta.servlet.http.HttpServletRequest
 
+import org.apache.spark.internal.config.UI._
 import org.apache.spark.ui.{SparkUI, SparkUITab, UIUtils, WebUIPage}
 
 private[ui] class ExecutorsTab(parent: SparkUI) extends SparkUITab(parent, "executors") {
@@ -29,11 +30,16 @@ private[ui] class ExecutorsTab(parent: SparkUI) extends SparkUITab(parent, "exec
 
   private def init(): Unit = {
     val threadDumpEnabled =
-      parent.sc.isDefined && parent.conf.getBoolean("spark.ui.threadDumpsEnabled", true)
+      parent.sc.isDefined && parent.conf.get(UI_THREAD_DUMPS_ENABLED)
+    val heapHistogramEnabled =
+      parent.sc.isDefined && parent.conf.get(UI_HEAP_HISTOGRAM_ENABLED)
 
-    attachPage(new ExecutorsPage(this, threadDumpEnabled))
+    attachPage(new ExecutorsPage(this, threadDumpEnabled, heapHistogramEnabled))
     if (threadDumpEnabled) {
       attachPage(new ExecutorThreadDumpPage(this, parent.sc))
+    }
+    if (heapHistogramEnabled) {
+      attachPage(new ExecutorHeapHistogramPage(this, parent.sc))
     }
   }
 
@@ -41,19 +47,31 @@ private[ui] class ExecutorsTab(parent: SparkUI) extends SparkUITab(parent, "exec
 
 private[ui] class ExecutorsPage(
     parent: SparkUITab,
-    threadDumpEnabled: Boolean)
+    threadDumpEnabled: Boolean,
+    heapHistogramEnabled: Boolean)
   extends WebUIPage("") {
 
   def render(request: HttpServletRequest): Seq[Node] = {
+    val imported = UIUtils.formatImportJavaScript(
+      request,
+      "/static/executorspage.js",
+      "setThreadDumpEnabled",
+      "setHeapHistogramEnabled")
+    val js =
+      s"""
+         |$imported
+         |
+         |setThreadDumpEnabled($threadDumpEnabled);
+         |setHeapHistogramEnabled($heapHistogramEnabled)
+         |""".stripMargin
     val content =
-      <div>
-        {
-          <div id="active-executors" class="row-fluid"></div> ++
-          <script src={UIUtils.prependBaseUri(request, "/static/utils.js")}></script> ++
-          <script src={UIUtils.prependBaseUri(request, "/static/executorspage.js")}></script> ++
-          <script>setThreadDumpEnabled({threadDumpEnabled})</script>
-        }
-      </div>
+      {
+        <div id="active-executors"></div> ++
+        <script type="module" src={UIUtils.prependBaseUri(request, "/static/utils.js")}></script> ++
+        <script type="module"
+                src={UIUtils.prependBaseUri(request, "/static/executorspage.js")}></script> ++
+        <script type="module">{Unparsed(js)}</script>
+      }
 
     UIUtils.headerSparkPage(request, "Executors", content, parent, useDataTables = true)
   }

@@ -18,9 +18,11 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.codegen.{GenerateMutableProjection, GenerateSafeProjection, GenerateUnsafeProjection}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DataType, StructType}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A [[Projection]] that is calculated by calling the `eval` of each of the specified expressions.
@@ -30,17 +32,18 @@ import org.apache.spark.sql.types.{DataType, StructType}
  */
 class InterpretedProjection(expressions: Seq[Expression]) extends Projection {
   def this(expressions: Seq[Expression], inputSchema: Seq[Attribute]) =
-    this(expressions.map(BindReferences.bindReference(_, inputSchema)))
-
-  override def initialize(partitionIndex: Int): Unit = {
-    expressions.foreach(_.foreach {
-      case n: Nondeterministic => n.initialize(partitionIndex)
-      case _ =>
-    })
-  }
+    this(bindReferences(expressions, inputSchema))
 
   // null check is required for when Kryo invokes the no-arg constructor.
-  protected val exprArray = if (expressions != null) expressions.toArray else null
+  protected val exprArray = if (expressions != null) {
+    prepareExpressions(expressions, subExprEliminationEnabled = false).toArray
+  } else {
+    null
+  }
+
+  override def initialize(partitionIndex: Int): Unit = {
+    initializeExprs(exprArray.toImmutableArraySeq, partitionIndex)
+  }
 
   def apply(input: InternalRow): InternalRow = {
     val outputArray = new Array[Any](exprArray.length)
@@ -88,18 +91,18 @@ object MutableProjection
   }
 
   /**
-   * Returns an MutableProjection for given sequence of bound Expressions.
+   * Returns a MutableProjection for given sequence of bound Expressions.
    */
   def create(exprs: Seq[Expression]): MutableProjection = {
     createObject(exprs)
   }
 
   /**
-   * Returns an MutableProjection for given sequence of Expressions, which will be bound to
+   * Returns a MutableProjection for given sequence of Expressions, which will be bound to
    * `inputSchema`.
    */
   def create(exprs: Seq[Expression], inputSchema: Seq[Attribute]): MutableProjection = {
-    create(toBoundExprs(exprs, inputSchema))
+    create(bindReferences(exprs, inputSchema))
   }
 }
 
@@ -126,12 +129,6 @@ object UnsafeProjection
     InterpretedUnsafeProjection.createProjection(in)
   }
 
-  protected def toUnsafeExprs(exprs: Seq[Expression]): Seq[Expression] = {
-    exprs.map(_ transform {
-      case CreateNamedStruct(children) => CreateNamedStructUnsafe(children)
-    })
-  }
-
   /**
    * Returns an UnsafeProjection for given StructType.
    *
@@ -145,14 +142,14 @@ object UnsafeProjection
    * CAUTION: the returned projection object is *not* thread-safe.
    */
   def create(fields: Array[DataType]): UnsafeProjection = {
-    create(fields.zipWithIndex.map(x => BoundReference(x._2, x._1, true)))
+    create(fields.zipWithIndex.map(x => BoundReference(x._2, x._1, true)).toImmutableArraySeq)
   }
 
   /**
    * Returns an UnsafeProjection for given sequence of bound Expressions.
    */
   def create(exprs: Seq[Expression]): UnsafeProjection = {
-    createObject(toUnsafeExprs(exprs))
+    createObject(exprs)
   }
 
   def create(expr: Expression): UnsafeProjection = create(Seq(expr))
@@ -162,7 +159,7 @@ object UnsafeProjection
    * `inputSchema`.
    */
   def create(exprs: Seq[Expression], inputSchema: Seq[Attribute]): UnsafeProjection = {
-    create(toBoundExprs(exprs, inputSchema))
+    create(bindReferences(exprs, inputSchema))
   }
 }
 
@@ -188,7 +185,7 @@ object SafeProjection extends CodeGeneratorWithInterpretedFallback[Seq[Expressio
    * Returns a SafeProjection for given Array of DataTypes.
    */
   def create(fields: Array[DataType]): Projection = {
-    createObject(fields.zipWithIndex.map(x => new BoundReference(x._2, x._1, true)))
+    createObject(fields.zipWithIndex.map(x => BoundReference(x._2, x._1, true)).toImmutableArraySeq)
   }
 
   /**
@@ -203,6 +200,6 @@ object SafeProjection extends CodeGeneratorWithInterpretedFallback[Seq[Expressio
    * `inputSchema`.
    */
   def create(exprs: Seq[Expression], inputSchema: Seq[Attribute]): Projection = {
-    create(toBoundExprs(exprs, inputSchema))
+    create(bindReferences(exprs, inputSchema))
   }
 }

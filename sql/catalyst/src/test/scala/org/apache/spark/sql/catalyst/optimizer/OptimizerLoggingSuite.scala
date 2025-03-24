@@ -17,13 +17,11 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
-import scala.collection.mutable.ArrayBuffer
-
-import org.apache.log4j.{Appender, AppenderSkeleton, Level, Logger}
-import org.apache.log4j.spi.LoggingEvent
+import org.apache.logging.log4j.Level
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
+import org.apache.spark.sql.catalyst.expressions.InSet
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.RuleExecutor
@@ -32,47 +30,41 @@ import org.apache.spark.sql.internal.SQLConf
 class OptimizerLoggingSuite extends PlanTest {
 
   object Optimize extends RuleExecutor[LogicalPlan] {
-    val batches = Batch("Optimizer Batch", FixedPoint(100),
-      PushDownPredicate,
-      ColumnPruning,
-      CollapseProject) :: Nil
+    val batches =
+      Batch("Optimizer Batch", FixedPoint(100),
+        PushPredicateThroughNonJoin, ColumnPruning, CollapseProject) ::
+      Batch("Batch Has No Effect", Once,
+        ColumnPruning) :: Nil
   }
 
-  class MockAppender extends AppenderSkeleton {
-    val loggingEvents = new ArrayBuffer[LoggingEvent]()
-
-    override def append(loggingEvent: LoggingEvent): Unit = {
-      if (loggingEvent.getRenderedMessage().contains("Applying Rule")) {
-        loggingEvents.append(loggingEvent)
-      }
-    }
-
-    override def close(): Unit = {}
-    override def requiresLayout(): Boolean = false
-  }
-
-  private def withLogLevelAndAppender(level: Level, appender: Appender)(f: => Unit): Unit = {
-    val logger = Logger.getLogger(Optimize.getClass.getName.dropRight(1))
-    val restoreLevel = logger.getLevel
-    logger.setLevel(level)
-    logger.addAppender(appender)
-    try f finally {
-      logger.setLevel(restoreLevel)
-      logger.removeAppender(appender)
-    }
-  }
-
-  private def verifyLog(expectedLevel: Level, expectedRules: Seq[String]): Unit = {
-    val logAppender = new MockAppender()
-    withLogLevelAndAppender(Level.TRACE, logAppender) {
-      val input = LocalRelation('a.int, 'b.string, 'c.double)
-      val query = input.select('a, 'b).select('a).where('a > 1).analyze
-      val expected = input.where('a > 1).select('a).analyze
+  private def verifyLog(expectedLevel: Level, expectedRulesOrBatches: Seq[String]): Unit = {
+    val logAppender = new LogAppender("optimizer rules")
+    logAppender.setThreshold(expectedLevel)
+    withLogAppender(logAppender,
+      loggerNames = Seq("org.apache.spark.sql.catalyst.rules.PlanChangeLogger"),
+      level = Some(Level.TRACE)) {
+      val input = LocalRelation($"a".int, $"b".string, $"c".double)
+      val query = input.select($"a", $"b").select($"a").where($"a" > 1).analyze
+      val expected = input.where($"a" > 1).select($"a").analyze
       comparePlans(Optimize.execute(query), expected)
     }
-    val logMessages = logAppender.loggingEvents.map(_.getRenderedMessage)
-    assert(expectedRules.forall(rule => logMessages.exists(_.contains(rule))))
-    assert(logAppender.loggingEvents.forall(_.getLevel == expectedLevel))
+    val events = logAppender.loggingEvents.filter {
+      case event => Seq(
+        "Applying Rule",
+        "Result of Batch",
+        "has no effect",
+        "Metrics of Executed Rules").exists(event.getMessage().getFormattedMessage.contains)
+    }
+    val logMessages = events.map(_.getMessage.getFormattedMessage)
+    assert(expectedRulesOrBatches.forall
+    (ruleOrBatch => logMessages.exists(_.contains(ruleOrBatch))))
+    assert(events.forall(_.getLevel == expectedLevel))
+    val expectedMetrics = Seq(
+      "Total number of runs: 7",
+      "Total time:",
+      "Total number of effective runs: 3",
+      "Total time of effective runs:")
+    assert(expectedMetrics.forall(metrics => logMessages.exists(_.contains(metrics))))
   }
 
   test("test log level") {
@@ -90,11 +82,11 @@ class OptimizerLoggingSuite extends PlanTest {
       "deBUG" -> Level.DEBUG)
 
     levels.foreach { level =>
-      withSQLConf(SQLConf.OPTIMIZER_PLAN_CHANGE_LOG_LEVEL.key -> level._1) {
+      withSQLConf(SQLConf.PLAN_CHANGE_LOG_LEVEL.key -> level._1) {
         verifyLog(
           level._2,
           Seq(
-            PushDownPredicate.ruleName,
+            PushPredicateThroughNonJoin.ruleName,
             ColumnPruning.ruleName,
             CollapseProject.ruleName))
       }
@@ -109,24 +101,24 @@ class OptimizerLoggingSuite extends PlanTest {
 
     levels.foreach { level =>
       val error = intercept[IllegalArgumentException] {
-        withSQLConf(SQLConf.OPTIMIZER_PLAN_CHANGE_LOG_LEVEL.key -> level) {}
+        withSQLConf(SQLConf.PLAN_CHANGE_LOG_LEVEL.key -> level) {}
       }
       assert(error.getMessage.contains(
-        "Invalid value for 'spark.sql.optimizer.planChangeLog.level'."))
+        "Invalid value for 'spark.sql.planChangeLog.level'."))
     }
   }
 
   test("test log rules") {
     val rulesSeq = Seq(
-      Seq(PushDownPredicate.ruleName,
+      Seq(PushPredicateThroughNonJoin.ruleName,
         ColumnPruning.ruleName,
         CollapseProject.ruleName).reduce(_ + "," + _) ->
-        Seq(PushDownPredicate.ruleName,
+        Seq(PushPredicateThroughNonJoin.ruleName,
           ColumnPruning.ruleName,
           CollapseProject.ruleName),
-      Seq(PushDownPredicate.ruleName,
+      Seq(PushPredicateThroughNonJoin.ruleName,
         ColumnPruning.ruleName).reduce(_ + "," + _) ->
-        Seq(PushDownPredicate.ruleName,
+        Seq(PushPredicateThroughNonJoin.ruleName,
           ColumnPruning.ruleName),
       CollapseProject.ruleName ->
         Seq(CollapseProject.ruleName),
@@ -139,10 +131,36 @@ class OptimizerLoggingSuite extends PlanTest {
 
     rulesSeq.foreach { case (rulesConf, expectedRules) =>
       withSQLConf(
-        SQLConf.OPTIMIZER_PLAN_CHANGE_LOG_RULES.key -> rulesConf,
-        SQLConf.OPTIMIZER_PLAN_CHANGE_LOG_LEVEL.key -> "INFO") {
+        SQLConf.PLAN_CHANGE_LOG_RULES.key -> rulesConf,
+        SQLConf.PLAN_CHANGE_LOG_LEVEL.key -> "INFO") {
         verifyLog(Level.INFO, expectedRules)
       }
     }
+  }
+
+  test("test log batches which change the plan") {
+    withSQLConf(
+      SQLConf.PLAN_CHANGE_LOG_BATCHES.key -> "Optimizer Batch",
+      SQLConf.PLAN_CHANGE_LOG_LEVEL.key -> "INFO") {
+      verifyLog(Level.INFO, Seq("Optimizer Batch"))
+    }
+  }
+
+  test("test log batches which do not change the plan") {
+    withSQLConf(
+      SQLConf.PLAN_CHANGE_LOG_BATCHES.key -> "Batch Has No Effect",
+      SQLConf.PLAN_CHANGE_LOG_LEVEL.key -> "INFO") {
+      verifyLog(Level.INFO, Seq("Batch Has No Effect"))
+    }
+  }
+
+  test("SPARK-50329: toString for InSet should be valid for unresolved plan") {
+    val input = LocalRelation($"a".int, $"b".string, $"c".double)
+    val inSetPredicate = InSet($"a", Set(1, 2))
+    val query = input.select($"a", $"b").where(inSetPredicate)
+    val analyzed = query.analyze
+
+    assert(query.toString.contains("'a INSET (values with unresolved data types)"))
+    assert(analyzed.toString.contains("INSET 1, 2"))
   }
 }
